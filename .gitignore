@@ -1,0 +1,5 @@
+*.log
+*.bak*
+email_state.json
+for export/
+ui_test_results.txt
