@@ -1,0 +1,62 @@
+﻿[
+    {
+        "Key":  "error.txt|",
+        "OriginalName":  "_error.txt",
+        "RelFolder":  "(root)",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    },
+    {
+        "Key":  "start.dat|",
+        "OriginalName":  "_start.dat",
+        "RelFolder":  "(root)",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    },
+    {
+        "Key":  "start.gx|",
+        "OriginalName":  "_start.gx",
+        "RelFolder":  "(root)",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    },
+    {
+        "Key":  "start.gxi|",
+        "OriginalName":  "_start.gxi",
+        "RelFolder":  "(root)",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    },
+    {
+        "Key":  "general.pg2|profiles",
+        "OriginalName":  "General.pg2",
+        "RelFolder":  "profiles",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    },
+    {
+        "Key":  "new_player.pr2|profiles",
+        "OriginalName":  "new_player.pr2",
+        "RelFolder":  "profiles",
+        "LastDoneDate":  "2025-08-10",
+        "DueDate":  "",
+        "Status":  "Pending",
+        "AddedOn":  "2026-03-07",
+        "Note":  ""
+    }
+]

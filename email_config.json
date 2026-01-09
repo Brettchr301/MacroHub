@@ -1,0 +1,59 @@
+{
+  "vipSenders": [
+    "manager@example.com",
+    "director@example.com",
+    "admin@example.com"
+  ],
+  "views": {
+    "Daily Accounting": {
+      "keywords": ["journal entry", "reconciliation", "bank statement", "GL", "general ledger", "accrual", "adjustment"],
+      "senderFilter": "",
+      "folderFilter": "Inbox",
+      "maxAgeDays": 3
+    },
+    "Month End Close": {
+      "keywords": ["month end", "close", "trial balance", "closing entry", "period close", "cutoff"],
+      "senderFilter": "",
+      "folderFilter": "Inbox",
+      "maxAgeDays": 7
+    },
+    "Approvals": {
+      "keywords": ["approve", "approval", "sign off", "authorization", "review and approve"],
+      "senderFilter": "",
+      "folderFilter": "Inbox",
+      "maxAgeDays": 5
+    },
+    "Audit Requests": {
+      "keywords": ["audit", "PBC", "provided by client", "confirmation", "audit request", "supporting documentation"],
+      "senderFilter": "",
+      "folderFilter": "Inbox",
+      "maxAgeDays": 14
+    },
+    "Vendor Follow-Ups": {
+      "keywords": ["invoice", "payment", "vendor", "purchase order", "PO", "remittance", "past due", "overdue"],
+      "senderFilter": "",
+      "folderFilter": "Inbox",
+      "maxAgeDays": 10
+    }
+  },
+  "replyTemplates": {
+    "Acknowledge": "Hi,\n\nThank you for your email. I've received this and will review shortly.\n\nBest regards",
+    "Need More Info": "Hi,\n\nThank you for reaching out. Could you please provide additional details so I can assist further?\n\nBest regards",
+    "Will Review": "Hi,\n\nI'll review this and get back to you by end of day.\n\nBest regards",
+    "Forwarding": "Hi,\n\nI'm forwarding this to the appropriate team for handling.\n\nBest regards",
+    "Month End": "Hi,\n\nThank you. I'll incorporate this into the month-end close process.\n\nBest regards",
+    "Approval Granted": "Hi,\n\nReviewed and approved. Please proceed.\n\nBest regards"
+  },
+  "agingBuckets": [
+    { "label": "Today",       "minDays": 0,  "maxDays": 0,  "color": "#4C9FE6" },
+    { "label": "1-3 Days",    "minDays": 1,  "maxDays": 3,  "color": "#50C878" },
+    { "label": "4-7 Days",    "minDays": 4,  "maxDays": 7,  "color": "#FFD700" },
+    { "label": "8-14 Days",   "minDays": 8,  "maxDays": 14, "color": "#FFA500" },
+    { "label": "15-30 Days",  "minDays": 15, "maxDays": 30, "color": "#E05050" },
+    { "label": "30+ Days",    "minDays": 31, "maxDays": 9999,"color": "#FF0000" }
+  ],
+  "internalDomains": ["example.com", "corp.example.com"],
+  "defaultFetchCount": 100,
+  "calendarReminderMinutes": 15,
+  "recallMaxAgeHours": 1
+}
