@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 280px;
+      padding: 14px 16px 12px;
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 13px;
+      background: #1B1B1F;
+      color: #E0E0E0;
+      margin: 0;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      color: #4C9FE6;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #2A3F2E;
+      color: #6FCF6F;
+    }
+    .pill.off {
+      background: #3A2A2A;
+      color: #CF6F6F;
+    }
+    button {
+      width: 100%;
+      padding: 7px 12px;
+      margin-top: 8px;
+      background: #2E75B6;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    button:hover { background: #3A8FD0; }
+    button.secondary { background: #3E3E42; }
+    button.secondary:hover { background: #555; }
+    #status {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      min-height: 18px;
+      white-space: pre-wrap;
+    }
+    .help {
+      margin-top: 10px;
+      color: #8EA9C3;
+      font-size: 11px;
+      line-height: 1.3;
+    }
+    hr { border: none; border-top: 1px solid #3E3E42; margin: 10px 0; }
+    .label { font-size: 11px; color: #888; margin-bottom: 2px; }
+  </style>
+</head>
+<body>
+  <h2>MacroHub Bridge</h2>
+
+  <div class="label">Connection status</div>
+  <span id="connPill" class="pill off">Checking...</span>
+
+  <hr>
+
+  <div class="label">Actions</div>
+  <button id="captureBtn">Capture Latest Response</button>
+  <button id="checkBtn" class="secondary">Check Connection</button>
+
+  <div id="status"></div>
+  <div class="help">Open Copilot in this tab for active prompt injection.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
