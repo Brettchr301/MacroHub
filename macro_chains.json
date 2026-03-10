@@ -1,0 +1,42 @@
+﻿[
+    {
+        "Name":  "Daily Prep - Clean and Format",
+        "Steps":  [
+                      "TrimUsedRangeText.ps1",
+                      "RemoveBlankRows.ps1",
+                      "ConvertTextNumbers.ps1",
+                      "NormalizeDateText.ps1",
+                      "HeaderBandAndFilter.ps1",
+                      "ApplyStandardNumberFormat.ps1",
+                      "AutoFitUsedRange.ps1"
+                  ],
+        "SavedOn":  "2026-03-12 23:44:11"
+    },
+    {
+        "Name":  "Filter Reset + Header Stamp",
+        "Steps":  [
+                      "ClearActiveFilters.bas",
+                      "HeaderBandAndFilter.ps1",
+                      "AutoFitUsedRange.ps1"
+                  ],
+        "SavedOn":  "2026-03-12 23:44:11"
+    },
+    {
+        "Name":  "QA Sweep - Blanks and Formula Errors",
+        "Steps":  [
+                      "HighlightBlanks.ps1",
+                      "HighlightFormulaErrors.ps1",
+                      "AutoFitUsedRange.ps1"
+                  ],
+        "SavedOn":  "2026-03-12 23:44:11"
+    },
+    {
+        "Name":  "Reporting - Recalc and Export CSV",
+        "Steps":  [
+                      "RecalculateWorkbook.ps1",
+                      "FreezeTopRow.ps1",
+                      "ExportActiveSheetCsv.ps1"
+                  ],
+        "SavedOn":  "2026-03-12 23:44:11"
+    }
+]
