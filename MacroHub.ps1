@@ -1,14 +1,15 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    MacroHub v3.1 - Office Productivity Super App
+    MacroHub v3.2 - Office Productivity Super App
 .DESCRIPTION
-    Merged: MacroHub automation suite + QuarterSync quarterly tracker.
-    7 tabs: Clipboard | Macros | Scheduler | Navigator | Templates | QSync | QTasks
+    Merged: MacroHub automation suite + QuarterSync quarterly tracker + File Index.
+    8 tabs: Clipboard | Macros | Scheduler | Navigator | Templates | QSync | QTasks | File Index
 
     Chrome/Teams dark-mode UI. Pure PowerShell 5.1 / WPF. No external modules.
 
     Color palette: black/grey/white text, blue accents, red for destructive only.
+    Contrast: all labels ≥ #909090 on dark backgrounds for WCAG AA readability.
 #>
 
 # ============================================================
@@ -40,7 +41,7 @@ $script:ActiveQuarterCSV = ''  # legacy alias
 $script:FavJson      = Join-Path $script:HubRoot 'favorites.json'
 $script:FavCSV       = Join-Path $script:HubRoot 'favorites.csv'      # legacy import only
 $script:ClipDefaultsJson = Join-Path $script:HubRoot 'clip_defaults.json'
-$script:AppVersion   = '3.1.0'
+$script:AppVersion   = '3.2.0'
 
 # ============================================================
 #  GLOBAL STATE
@@ -65,6 +66,8 @@ $script:ExcelNavApp    = $null
 # ============================================================
 #  HELPER: Solid color brush from hex string (cached + frozen)
 # ============================================================
+# Returns a frozen SolidColorBrush for the given hex color string (e.g. '#4C9FE6').
+# Brushes are cached by hex string so repeated calls are allocation-free.
 $script:BrushCache = @{}
 function HexBrush([string]$hex) {
     $b = $script:BrushCache[$hex]
@@ -282,6 +285,7 @@ function Paste-TextToSheet {
 # ============================================================
 #  MACRO DISCOVERY
 # ============================================================
+# Returns all .ps1 and .bas files found under $script:MacroFolder (recursive).
 function Get-MacroFiles {
     if (-not (Test-Path $script:MacroFolder)) { return @() }
     $files = Get-ChildItem -Path $script:MacroFolder -Recurse -File -ErrorAction SilentlyContinue |
@@ -292,6 +296,14 @@ function Get-MacroFiles {
 # ============================================================
 #  MACRO EXECUTION
 # ============================================================
+# Invoke-VbaMacro: Imports a .bas module into the target workbook, runs the first
+#   Public Sub, then removes the module. Requires Excel's Trust Access to VBA Project.
+#
+# Invoke-PsScript: Runs a .ps1 script, passing -WorkbookName and -SheetName as
+#   optional parameters. Falls back to workbook-only if the script doesn't accept SheetName.
+#
+# Invoke-SelectedMacro: Dispatcher — routes to Invoke-VbaMacro or Invoke-PsScript
+#   based on the file extension.
 function Invoke-VbaMacro {
     param(
         [string]$MacroFile,
@@ -375,6 +387,13 @@ function Invoke-SelectedMacro {
 # ============================================================
 #  TASK SCHEDULER (Windows Task Scheduler COM)
 # ============================================================
+# All scheduled tasks are stored under the '\MacroHub' folder in Windows Task Scheduler.
+#
+# Get-HubTasks:          Returns a list of task objects (name, state, next/last run times).
+# Get-MissedTasks:       Returns tasks that should have run but didn't (PC was off).
+# Invoke-MissedTaskCheck: Startup check — prompts to run each missed task.
+# Register-HubTask:      Creates a new daily/weekly/monthly trigger task via Schedule.Service COM.
+# Remove-HubTask:        Deletes a task from the '\MacroHub' scheduler folder.
 function Get-HubTasks {
     $tasks = @()
     try {
@@ -711,6 +730,20 @@ function Save-ClipDefaults {
 }
 
 # ============================================================
+#  CLIPBOARD PACKET CAPTURE + PASTE ENGINE
+# ============================================================
+# Get-ClipboardPacket:
+#   Captures the current Windows clipboard as a replayable packet.
+#   Stores: DataObject (IDataObject), plain Text, format list, SHA-1 Signature, and
+#   ExcelSource metadata (workbook/sheet/address) when Excel has an active copy selection.
+#
+# Paste-ClipboardPacketToExcel:
+#   Path 1 — Direct Range.Copy(Destination) via ExcelSource metadata (copies all formatting).
+#   Path 2 — Native clipboard paste: restores DataObject → PasteSpecial(xlPasteAll).
+#   Path 3 — Plain-text Value2 fallback + PasteSpecial(xlPasteFormats) overlay from source.
+#   Post-paste house-style rules are only applied when no Excel formatting was preserved.
+#
+# ============================================================
 #  DYNAMIC CLIPBOARD SLOT UI BUILDER
 # ============================================================
 $script:ClipSlotIdx = 0
@@ -999,9 +1032,13 @@ function Paste-ClipboardPacketToExcel {
     $dest.ClearContents()
     $dest.ClearFormats()
 
-    # Best-case formatting path for Excel source copy: replay source range directly.
+    # Track whether native Excel formatting was preserved (suppresses post-paste style rules).
     $usedClipboardPaste = $false
+    $formattingApplied  = $false
     $source = $Packet.ExcelSource
+
+    # ── PATH 1: Direct Excel range copy — copies values + ALL formatting in one shot ──
+    # Requires source workbook still open in any Excel session.
     if ($source -and $source.WorkbookName -and $source.SheetName -and $source.Address) {
         try {
             # Try all known Excel sessions so cross-session copies (e.g. Navigator) work.
@@ -1013,14 +1050,13 @@ function Paste-ClipboardPacketToExcel {
                 } catch {}
             }
             if (-not $srcWb) { throw 'Source workbook not found in any Excel session.' }
-            $srcWs = $srcWb.Worksheets.Item([string]$source.SheetName)
+            $srcWs    = $srcWb.Worksheets.Item([string]$source.SheetName)
             $srcRange = $srcWs.Range([string]$source.Address)
-            $srcRows = [Math]::Max(1, [int]$srcRange.Rows.Count)
-            $srcCols = [Math]::Max(1, [int]$srcRange.Columns.Count)
-            # Some Excel sessions report Selection as 1x1 even when clipboard holds a larger range.
-            # If we captured larger clipboard text dimensions, expand from the source anchor cell.
-            $canExpandFromText = ($srcRows -eq 1 -and $srcCols -eq 1 -and ($textCols -gt 1 -or $textRows -gt 1))
-            if ($canExpandFromText) {
+            $srcRows  = [Math]::Max(1, [int]$srcRange.Rows.Count)
+            $srcCols  = [Math]::Max(1, [int]$srcRange.Columns.Count)
+            # Some Excel sessions report Selection as 1×1 even when clipboard holds a larger range.
+            # Expand from the source anchor cell when text dimensions indicate a larger copy.
+            if ($srcRows -eq 1 -and $srcCols -eq 1 -and ($textCols -gt 1 -or $textRows -gt 1)) {
                 $maxRow = [Math]::Min(1048576, [int]$srcRange.Row + $textRows - 1)
                 $maxCol = [Math]::Min(16384,   [int]$srcRange.Column + $textCols - 1)
                 $srcRange = $srcWs.Range(
@@ -1038,11 +1074,13 @@ function Paste-ClipboardPacketToExcel {
             )
             $dest.ClearContents()
             $dest.ClearFormats()
-            $srcRange.Copy($dest)
+            $srcRange.Copy($dest)           # Range.Copy(Destination) copies values + all formatting
             $usedClipboardPaste = $true
+            $formattingApplied  = $true
         } catch {}
     }
 
+    # ── PATH 2: Native clipboard paste (preserves Excel formats when clipboard is live) ──
     $packetSig = [string]$Packet.Signature
     if (-not $packetSig) { $packetSig = Get-TextSha1 ([string]$Packet.Text + '|' + [string]$Packet.Formats) }
     $liveClipboardSame = $false
@@ -1055,7 +1093,6 @@ function Paste-ClipboardPacketToExcel {
         } catch {}
     }
 
-    # For formatted clipboard payloads (Excel/HTML/RTF), retry native paste next.
     $maxPasteAttempts = 4
     for ($attempt = 1; $attempt -le $maxPasteAttempts -and -not $usedClipboardPaste; $attempt++) {
         try {
@@ -1076,7 +1113,7 @@ function Paste-ClipboardPacketToExcel {
             $ws.Activate()
             $target.Select()
             try {
-                $target.PasteSpecial(-4104)  # xlPasteAll
+                $target.PasteSpecial(-4104)  # xlPasteAll — includes values, formats, and formulas
             } catch {
                 $ws.Paste($target)
             }
@@ -1098,6 +1135,7 @@ function Paste-ClipboardPacketToExcel {
             }
 
             $usedClipboardPaste = $true
+            $formattingApplied  = $true     # Native xlPasteAll includes formatting
         } catch {
             # If live clipboard attempt failed, fall back to packet replay attempts.
             if ($liveClipboardSame) { $liveClipboardSame = $false }
@@ -1105,13 +1143,54 @@ function Paste-ClipboardPacketToExcel {
         }
     }
 
+    # ── PATH 3: Plain-text fallback — values only via 2D array assignment ──
     if (-not $usedClipboardPaste) {
-        # Fallback for plain text payloads: use 2D array assignment for large paste speed.
         $matrix = Convert-ClipboardTextToMatrix -Text $Packet.Text -Rows $rows -Cols $cols
         $dest.Value2 = $matrix
+
+        # ── PATH 3b: Overlay source formatting after text paste ──
+        # If the source workbook is still open, re-copy the source range to clipboard and
+        # paste only formats (xlPasteFormats = -4122) on top of the already-pasted values.
+        # This preserves fonts, fill colors, borders, and number formats even when the
+        # DataObject clipboard path was unavailable.
+        if ($source -and $source.WorkbookName -and $source.SheetName -and $source.Address) {
+            try {
+                $fmtWb = $null
+                foreach ($fmtSess in @('Main', 'Navigator', 'Any')) {
+                    try {
+                        $fmtXl = Get-ExcelApp -Session $fmtSess
+                        if ($fmtXl) { $fmtWb = $fmtXl.Workbooks.Item([string]$source.WorkbookName); break }
+                    } catch {}
+                }
+                if ($fmtWb) {
+                    $fmtWs    = $fmtWb.Worksheets.Item([string]$source.SheetName)
+                    $fmtRange = $fmtWs.Range([string]$source.Address)
+                    # Expand 1×1 anchor to match text dimensions.
+                    $fmtRows = [Math]::Max(1, [int]$fmtRange.Rows.Count)
+                    $fmtCols = [Math]::Max(1, [int]$fmtRange.Columns.Count)
+                    if ($fmtRows -eq 1 -and $fmtCols -eq 1 -and ($textCols -gt 1 -or $textRows -gt 1)) {
+                        $maxRow = [Math]::Min(1048576, [int]$fmtRange.Row + $textRows - 1)
+                        $maxCol = [Math]::Min(16384,   [int]$fmtRange.Column + $textCols - 1)
+                        $fmtRange = $fmtWs.Range(
+                            $fmtWs.Cells.Item([int]$fmtRange.Row, [int]$fmtRange.Column),
+                            $fmtWs.Cells.Item($maxRow, $maxCol)
+                        )
+                    }
+                    $fmtRange.Copy()                    # Puts full Excel range (with formats) on clipboard
+                    $dest.PasteSpecial(-4122)           # xlPasteFormats — applies only formatting, not values
+                    try { $xl.CutCopyMode = $false } catch {}
+                    $formattingApplied = $true
+                }
+            } catch {}
+        }
     }
 
-    Apply-PostPasteCellRules -Worksheet $ws -StartRow $r -StartCol $c -Rows $rows -Cols $cols
+    # Only apply post-paste house-style rules (unwrap data rows, apply comma number format)
+    # when no Excel source formatting was preserved. When formatting comes from Excel, we
+    # respect the original cell styles rather than overwriting them.
+    if (-not $formattingApplied) {
+        Apply-PostPasteCellRules -Worksheet $ws -StartRow $r -StartCol $c -Rows $rows -Cols $cols
+    }
 
     if ($AddTimestamp) {
         $dOff = 1; $tOff = 2
@@ -1128,6 +1207,9 @@ function Paste-ClipboardPacketToExcel {
     }
 }
 
+# Add-ClipSlotUI: Programmatically builds one clipboard slot card and appends it to
+# ClipSlotsPanel. Each card contains a text preview box, per-slot sheet/cell/timestamp
+# controls, and Record/Paste/Remove buttons. State is tracked in $script:ClipSlots[$tag].
 function Add-ClipSlotUI {
     param(
         $Panel,
@@ -2131,13 +2213,115 @@ function Get-TextSha1([string]$Text) {
 # ================================================================
 #  XAML UI - Chrome/Teams Dark Theme
 # ================================================================
+# ============================================================
+#  FILE INDEX — DLP-safe metadata-only drive search
+# ============================================================
+# Scans a folder tree, caches file metadata (name/path/size/dates) as JSON, and
+# provides real-time in-memory filtering. Never reads file contents.
+# A 60-minute cooldown prevents accidental repeated full scans of large trees.
+
+$script:FidxCacheJson   = Join-Path $script:HubRoot 'fileindex_cache.json'
+$script:FidxLastScan    = $null          # [datetime] of last successful scan
+$script:FidxAllItems    = @()            # full unfiltered index (array of PSCustomObjects)
+$script:FidxCooldownSec = 3600           # seconds between allowed rescans (60 min)
+$script:FidxCooldownTimer = $null        # DispatcherTimer for cooldown countdown
+
+function Get-FidxCacheAgeSec {
+    if (-not $script:FidxLastScan) { return [int]::MaxValue }
+    return [int]((Get-Date) - $script:FidxLastScan).TotalSeconds
+}
+
+function Format-FidxSize([long]$bytes) {
+    if ($bytes -ge 1GB) { return '{0:N1} GB' -f ($bytes / 1GB) }
+    if ($bytes -ge 1MB) { return '{0:N1} MB' -f ($bytes / 1MB) }
+    if ($bytes -ge 1KB) { return '{0:N1} KB' -f ($bytes / 1KB) }
+    return '{0} B' -f $bytes
+}
+
+function Invoke-FidxScan {
+    param([string]$RootPath)
+    if (-not (Test-Path $RootPath -PathType Container)) {
+        throw "Folder not found: $RootPath"
+    }
+    $items = @()
+    $files = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue
+    foreach ($f in $files) {
+        $items += [PSCustomObject]@{
+            Name     = $f.Name
+            Path     = $f.FullName
+            SizeStr  = (Format-FidxSize $f.Length)
+            Modified = $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+            Ext      = $f.Extension.ToLower()
+            SizeBytes = [long]$f.Length
+        }
+    }
+    return ,$items
+}
+
+function Save-FidxCache {
+    param([array]$Items, [string]$Root)
+    try {
+        $cache = [ordered]@{
+            Root      = $Root
+            ScannedOn = (Get-Date -f 'yyyy-MM-dd HH:mm:ss')
+            Count     = $Items.Count
+            Items     = @($Items | Select-Object Name, Path, SizeStr, Modified, Ext, SizeBytes)
+        }
+        $cache | ConvertTo-Json -Depth 3 -Compress | Set-Content $script:FidxCacheJson -Encoding UTF8
+    } catch {}
+}
+
+function Load-FidxCache {
+    if (-not (Test-Path $script:FidxCacheJson)) { return $null }
+    try {
+        $raw = Get-Content $script:FidxCacheJson -Raw | ConvertFrom-Json
+        return $raw
+    } catch { return $null }
+}
+
+function Get-FidxFiltered {
+    param([string]$Query)
+    if ([string]::IsNullOrWhiteSpace($Query)) { return ,$script:FidxAllItems }
+    $q = $Query.Trim().ToLower()
+    return ,@($script:FidxAllItems | Where-Object {
+        $_.Name.ToLower().Contains($q) -or
+        $_.Path.ToLower().Contains($q) -or
+        $_.Ext.ToLower().Contains($q)
+    })
+}
+
+function Start-FidxCooldownTimer {
+    if ($script:FidxCooldownTimer) {
+        try { $script:FidxCooldownTimer.Stop() } catch {}
+    }
+    $timer = [System.Windows.Threading.DispatcherTimer]::new()
+    $timer.Interval = [TimeSpan]::FromSeconds(10)
+    $timer.Add_Tick({
+        $age = Get-FidxCacheAgeSec
+        $remaining = $script:FidxCooldownSec - $age
+        if ($remaining -le 0) {
+            $FidxIndexBtn.IsEnabled = $true
+            $FidxCooldownTxt.Text = ''
+            $script:FidxCooldownTimer.Stop()
+        } else {
+            $FidxIndexBtn.IsEnabled = $false
+            $mins = [Math]::Ceiling($remaining / 60)
+            $FidxCooldownTxt.Text = "  Refresh available in ~${mins}m"
+        }
+    })
+    $script:FidxCooldownTimer = $timer
+    $timer.Start()
+}
+
+# ============================================================
+
 function Start-MacroHub {
 
 $xamlStr = @"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="MacroHub v3.1" Height="860" Width="1200"
+    Title="MacroHub v3.2" Height="860" Width="1200"
     MinHeight="640" MinWidth="960"
     WindowStartupLocation="CenterScreen"
     Background="#1B1B1F"
@@ -2351,7 +2535,7 @@ $xamlStr = @"
     </Style>
 
     <Style TargetType="TabItem">
-      <Setter Property="Foreground"      Value="#6E6E6E"/>
+      <Setter Property="Foreground"      Value="#A0A0A0"/>
       <Setter Property="Background"      Value="Transparent"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Padding"         Value="18,12"/>
@@ -2439,61 +2623,46 @@ $xamlStr = @"
         <Grid Margin="24,18">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="14"/>
+            <RowDefinition Height="12"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="14"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
 
+          <!-- Target workbook selector + global controls -->
           <Border Grid.Row="0" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1" Padding="16,12">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="240"/>
-                <ColumnDefinition Width="16"/>
-                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="260"/>
+                <ColumnDefinition Width="14"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-              </Grid.ColumnDefinitions>
-              <TextBlock Grid.Column="0" Text="Workbook" Foreground="#B0B0B0" FontSize="12" VerticalAlignment="Center"/>
-              <ComboBox  Grid.Column="2" x:Name="ClipWbCombo"/>
-              <Button    Grid.Column="4" x:Name="ClipRefreshBtn" Content="_Refresh" Style="{StaticResource Btn}" Padding="12,6"/>
-              <Button    Grid.Column="5" x:Name="ClipLockBtn" Content="_Lock Defaults" Style="{StaticResource BtnAccent}" Padding="10,6" Margin="8,0,0,0" ToolTip="Save workbook + slot-1 sheet/cell/timestamp settings as defaults for new slots"/>
-              <Button    Grid.Column="6" x:Name="ClipClearDefaultsBtn" Content="Clear De_faults" Style="{StaticResource Btn}" Padding="10,6" Margin="4,0,0,0" Foreground="#E05050" ToolTip="Remove saved defaults"/>
-              <TextBlock Grid.Column="7" x:Name="ClipDefaultsIndicator" Text="(defaults loaded)" Foreground="#4C9FE6" FontSize="10" VerticalAlignment="Center" Margin="8,0,0,0" Visibility="Collapsed"/>
-            </Grid>
-          </Border>
-
-          <Border Grid.Row="2" Background="#252528" CornerRadius="6"
-                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,8">
-            <Grid>
-              <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-
-              <TextBlock Grid.Column="0" Text="Each slot has its own sheet, cell, and timestamp settings next to Paste."
-                         Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center" Margin="0,0,10,0"/>
-
-              <StackPanel Grid.Column="2" Orientation="Horizontal">
-                <TextBlock Text="Slots:" Foreground="#6E6E6E" FontSize="11"
-                           VerticalAlignment="Center" Margin="0,0,6,0"/>
-                <TextBlock x:Name="ClipSlotCount" Text="0" Foreground="#4C9FE6" FontWeight="Bold"
-                           FontSize="12" VerticalAlignment="Center" Margin="0,0,12,0"/>
-                <Button x:Name="ClipAddSlotBtn" Content="+ _Add Slot" Style="{StaticResource BtnAccent}"
-                        Padding="10,4"/>
-                <Button x:Name="ClipRecordSeqBtn" Content="Record _Sequence" Style="{StaticResource Btn}"
-                        Padding="10,4" Margin="8,0,0,0" ToolTip="Capture each new clipboard copy into the next slot (slot1, slot2, slot3...)."/>
-                <TextBlock x:Name="ClipRecordSeqState" Text="SEQ OFF" Foreground="#6E6E6E" FontWeight="Bold"
-                           FontSize="10" VerticalAlignment="Center" Margin="8,0,0,0"/>
-              </StackPanel>
-
-              <StackPanel Grid.Column="1" Orientation="Horizontal" Visibility="Collapsed">
+              <TextBlock Grid.Column="0" Text="Target Workbook" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center"
+                         ToolTip="The Excel workbook all slots will paste into"/>
+              <ComboBox  Grid.Column="2" x:Name="ClipWbCombo"
+                         ToolTip="Select the open workbook to paste clipboard data into"/>
+              <Button    Grid.Column="4" x:Name="ClipRefreshBtn" Content="_Refresh Workbooks"
+                         Style="{StaticResource Btn}" Padding="12,6" Margin="0,0,0,0"
+                         ToolTip="Reload the list of open Excel workbooks"/>
+              <Button    Grid.Column="5" x:Name="ClipLockBtn" Content="_Save Defaults"
+                         Style="{StaticResource BtnAccent}" Padding="10,6" Margin="10,0,0,0"
+                         ToolTip="Save the current workbook and slot-1 sheet/cell/timestamp settings as defaults for new slots"/>
+              <Button    Grid.Column="6" x:Name="ClipClearDefaultsBtn" Content="_Clear Defaults"
+                         Style="{StaticResource Btn}" Padding="10,6" Margin="6,0,0,0"
+                         Foreground="#E05050" ToolTip="Remove saved default settings"/>
+              <TextBlock Grid.Column="7" x:Name="ClipDefaultsIndicator" Text="✓ Defaults loaded"
+                         Foreground="#4C9FE6" FontSize="11" VerticalAlignment="Center"
+                         Margin="10,0,0,0" Visibility="Collapsed"/>
+              <!-- Hidden backing controls for slot defaults — keep these, they are used by code -->
+              <StackPanel Grid.Column="8" Orientation="Horizontal" Visibility="Collapsed">
                 <ComboBox x:Name="ClipSheetCombo"/>
                 <TextBox x:Name="ClipCellBox" Text="A1"/>
                 <CheckBox x:Name="ClipTimestampChk"/>
@@ -2503,6 +2672,37 @@ $xamlStr = @"
             </Grid>
           </Border>
 
+          <!-- Slot controls toolbar -->
+          <Border Grid.Row="2" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+
+              <TextBlock Grid.Column="0"
+                         Text="Each slot captures one clipboard item. Set the destination sheet and cell per slot, then click Paste to write to Excel."
+                         Foreground="#909090" FontSize="11" VerticalAlignment="Center"
+                         TextWrapping="Wrap"/>
+
+              <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <TextBlock Text="Slots:" Foreground="#909090" FontSize="11"
+                           VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="ClipSlotCount" Text="0" Foreground="#4C9FE6" FontWeight="Bold"
+                           FontSize="13" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                <Button x:Name="ClipAddSlotBtn" Content="+ _Add Slot" Style="{StaticResource BtnAccent}"
+                        Padding="12,5" ToolTip="Add a new clipboard capture slot"/>
+                <Button x:Name="ClipRecordSeqBtn" Content="_Record Sequence"
+                        Style="{StaticResource Btn}" Padding="12,5" Margin="8,0,0,0"
+                        ToolTip="Auto-capture each successive clipboard copy into the next slot in order (Slot 1, 2, 3…)"/>
+                <TextBlock x:Name="ClipRecordSeqState" Text="SEQ OFF" Foreground="#909090"
+                           FontWeight="Bold" FontSize="11" VerticalAlignment="Center" Margin="10,0,0,0"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <!-- Clipboard slots -->
           <ScrollViewer Grid.Row="4" VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="ClipSlotsPanel" Orientation="Vertical"/>
           </ScrollViewer>
@@ -2517,6 +2717,7 @@ $xamlStr = @"
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
 
+          <!-- Macro file list (left panel) -->
           <Border Grid.Column="0" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -2526,49 +2727,65 @@ $xamlStr = @"
                 <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
               <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                <TextBlock Text="MACROS" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <TextBlock Text="MACRO FILES" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"
+                           ToolTip="PowerShell (.ps1) and VBA (.bas) files from the Macros folder"/>
               </Border>
               <ListBox Grid.Row="1" x:Name="MacroList" Background="Transparent"
-                       Foreground="#FFFFFF" BorderThickness="0" Padding="4"
-                       FontSize="12"/>
+                       Foreground="#FFFFFF" BorderThickness="0" Padding="6,4"
+                       FontSize="12"
+                       ToolTip="Click to select a macro, then configure and run it on the right"/>
               <Border Grid.Row="2" BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="10,8">
                 <StackPanel>
-                  <Button x:Name="MacroRefreshBtn" Content="Refresh _List" Style="{StaticResource Btn}"
-                          Padding="10,5" HorizontalAlignment="Stretch" Margin="0,0,0,4"/>
+                  <Button x:Name="MacroRefreshBtn" Content="_Refresh List" Style="{StaticResource Btn}"
+                          Padding="10,6" HorizontalAlignment="Stretch" Margin="0,0,0,6"
+                          ToolTip="Reload macro files from the Macros folder"/>
                   <Button x:Name="MacroFavBtn" Content="Toggle _Favorite" Style="{StaticResource BtnGreen}"
-                          Padding="10,5" HorizontalAlignment="Stretch"/>
+                          Padding="10,6" HorizontalAlignment="Stretch"
+                          ToolTip="Mark or unmark the selected macro as a favorite"/>
                 </StackPanel>
               </Border>
             </Grid>
           </Border>
 
+          <!-- Run macro panel (right panel) -->
           <Border Grid.Column="2" Background="#252528" CornerRadius="6"
-                  BorderBrush="#3E3E42" BorderThickness="1" Padding="20,16">
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="20,18">
             <StackPanel>
-              <TextBlock Text="RUN MACRO" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,14"/>
+              <TextBlock Text="RUN MACRO" Foreground="#A0A0A0" FontSize="11"
+                         FontWeight="SemiBold" Margin="0,0,0,16"/>
 
-              <TextBlock Text="Target Workbook" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"/>
-              <ComboBox x:Name="MacroWbCombo" Margin="0,0,0,16"/>
+              <TextBlock Text="Target Workbook" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"
+                         ToolTip="The open Excel workbook the macro will run against"/>
+              <ComboBox x:Name="MacroWbCombo" Margin="0,0,0,14"/>
 
-              <TextBlock Text="Target Sheet" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"/>
-              <ComboBox x:Name="MacroSheetCombo" Margin="0,0,0,16"/>
+              <TextBlock Text="Target Sheet (optional)" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"
+                         ToolTip="Specific worksheet to activate before running the macro"/>
+              <ComboBox x:Name="MacroSheetCombo" Margin="0,0,0,14"/>
 
               <TextBlock Text="Selected Macro" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"/>
-              <TextBox x:Name="MacroSelectedTxt" IsReadOnly="True" Foreground="#6E6E6E" Margin="0,0,0,16"/>
+              <TextBox x:Name="MacroSelectedTxt" IsReadOnly="True" Foreground="#909090"
+                       Margin="0,0,0,14"
+                       ToolTip="The macro file selected in the list on the left"/>
 
               <TextBlock Text="Description" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"/>
-              <TextBox x:Name="MacroDescTxt" IsReadOnly="True" Height="60"
+              <TextBox x:Name="MacroDescTxt" IsReadOnly="True" Height="64"
                        TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
-                       Foreground="#6E6E6E" Margin="0,0,0,20"/>
+                       Foreground="#909090" Margin="0,0,0,20"/>
 
               <Button x:Name="MacroRunBtn" Content="_Run Macro" Style="{StaticResource BtnAccent}"
-                      Padding="20,10" FontSize="13" HorizontalAlignment="Left"/>
+                      Padding="20,10" FontSize="13" HorizontalAlignment="Left"
+                      ToolTip="Execute the selected macro against the target workbook/sheet"/>
 
-              <TextBlock Text="OUTPUT" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold" Margin="0,20,0,6"/>
-              <TextBox x:Name="MacroOutputTxt" Height="120" IsReadOnly="True"
-                       TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
-                       FontFamily="Consolas" FontSize="11" Foreground="#B0B0B0"
-                       Background="Transparent" BorderThickness="0"/>
+              <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Margin="0,20,0,0" Padding="0,12,0,0">
+                <StackPanel>
+                  <TextBlock Text="OUTPUT" Foreground="#A0A0A0" FontSize="11"
+                             FontWeight="SemiBold" Margin="0,0,0,8"/>
+                  <TextBox x:Name="MacroOutputTxt" Height="120" IsReadOnly="True"
+                           TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                           FontFamily="Consolas" FontSize="11" Foreground="#B0B0B0"
+                           Background="Transparent" BorderThickness="0"/>
+                </StackPanel>
+              </Border>
             </StackPanel>
           </Border>
         </Grid>
@@ -2578,53 +2795,59 @@ $xamlStr = @"
         <Grid Margin="24,18">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
+            <RowDefinition Height="12"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
+            <RowDefinition Height="14"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
 
+          <!-- Scripts folder info bar -->
           <Border Grid.Row="0" Background="#1A2A3E" CornerRadius="6"
-                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+                  BorderBrush="#4C9FE6" BorderThickness="1" Padding="14,10">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="12"/>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="12"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <TextBlock Grid.Column="0" Text="Scripts Folder" Foreground="#4C9FE6" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
-              <TextBlock Grid.Column="2" x:Name="SchedFolderPath" Foreground="#B0B0B0" FontSize="11"
+              <TextBlock Grid.Column="0" Text="Scripts Folder" Foreground="#4C9FE6" FontSize="12"
+                         FontWeight="SemiBold" VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="2" x:Name="SchedFolderPath" Foreground="#B0B0B0" FontSize="12"
                          VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
-                         ToolTip="Drop .ps1 or .bas files here and they appear in the dropdown below"/>
+                         ToolTip="Drop .ps1 or .bas macro files into this folder — they will appear in the script dropdown below"/>
               <Button Grid.Column="4" x:Name="SchedOpenFolderBtn" Content="_Open Folder"
-                      Style="{StaticResource Btn}" Padding="10,4"/>
+                      Style="{StaticResource Btn}" Padding="12,5"
+                      ToolTip="Open the Macros folder in Windows Explorer"/>
             </Grid>
           </Border>
 
+          <!-- Create new scheduled task form -->
           <Border Grid.Row="2" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1" Padding="20,16">
             <StackPanel>
-              <Grid Margin="0,0,0,10">
+              <Grid Margin="0,0,0,12">
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="Auto"/>
                   <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
-                <TextBlock Grid.Column="0" Text="SCHEDULE A TASK" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                <TextBlock Grid.Column="1" Text="  Backed by Windows Task Scheduler -- runs even when MacroHub is closed"
-                           Foreground="#4C9FE6" FontSize="10" FontStyle="Italic" VerticalAlignment="Center"
-                           HorizontalAlignment="Right"/>
+                <TextBlock Grid.Column="0" Text="SCHEDULE A NEW TASK" Foreground="#A0A0A0"
+                           FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="1"
+                           Text="Backed by Windows Task Scheduler — tasks run even when MacroHub is closed"
+                           Foreground="#4C9FE6" FontSize="11" FontStyle="Italic"
+                           VerticalAlignment="Center" HorizontalAlignment="Right"/>
               </Grid>
               <Grid>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="12"/>
+                  <ColumnDefinition Width="14"/>
                   <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="12"/>
+                  <ColumnDefinition Width="14"/>
                   <ColumnDefinition Width="120"/>
-                  <ColumnDefinition Width="12"/>
-                  <ColumnDefinition Width="120"/>
+                  <ColumnDefinition Width="14"/>
+                  <ColumnDefinition Width="130"/>
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto"/>
@@ -2632,14 +2855,17 @@ $xamlStr = @"
                   <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <TextBlock Grid.Row="0" Grid.Column="0" Text="Task Name" Foreground="#B0B0B0" FontSize="11"/>
-                <TextBlock Grid.Row="0" Grid.Column="2" Text="Script / Macro" Foreground="#B0B0B0" FontSize="11"/>
-                <TextBlock Grid.Row="0" Grid.Column="4" Text="Time (HH:mm)" Foreground="#B0B0B0" FontSize="11"/>
-                <TextBlock Grid.Row="0" Grid.Column="6" Text="Frequency" Foreground="#B0B0B0" FontSize="11"/>
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Task Name" Foreground="#B0B0B0" FontSize="12"/>
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="Script or Macro File" Foreground="#B0B0B0" FontSize="12"/>
+                <TextBlock Grid.Row="0" Grid.Column="4" Text="Run Time (HH:mm)" Foreground="#B0B0B0" FontSize="12"/>
+                <TextBlock Grid.Row="0" Grid.Column="6" Text="Frequency" Foreground="#B0B0B0" FontSize="12"/>
 
-                <TextBox   Grid.Row="2" Grid.Column="0" x:Name="SchedNameBox"/>
-                <ComboBox  Grid.Row="2" Grid.Column="2" x:Name="SchedMacroCombo"/>
-                <TextBox   Grid.Row="2" Grid.Column="4" x:Name="SchedTimeBox" Text="09:00"/>
+                <TextBox   Grid.Row="2" Grid.Column="0" x:Name="SchedNameBox"
+                           ToolTip="Unique name for this scheduled task (shown in Windows Task Scheduler)"/>
+                <ComboBox  Grid.Row="2" Grid.Column="2" x:Name="SchedMacroCombo"
+                           ToolTip="Select a .ps1 or .bas script to run on schedule"/>
+                <TextBox   Grid.Row="2" Grid.Column="4" x:Name="SchedTimeBox" Text="09:00"
+                           ToolTip="24-hour time when the task runs (e.g. 09:00, 17:30)"/>
                 <ComboBox  Grid.Row="2" Grid.Column="6" x:Name="SchedFreqCombo">
                   <ComboBoxItem Content="Daily" IsSelected="True"/>
                   <ComboBoxItem Content="Weekly"/>
@@ -2647,12 +2873,16 @@ $xamlStr = @"
                 </ComboBox>
               </Grid>
               <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
-                <Button x:Name="SchedCreateBtn" Content="_Create Task" Style="{StaticResource BtnAccent}" Padding="14,7" Margin="0,0,10,0"/>
-                <Button x:Name="SchedRefreshBtn" Content="_Refresh" Style="{StaticResource Btn}" Padding="14,7"/>
+                <Button x:Name="SchedCreateBtn" Content="_Create Task" Style="{StaticResource BtnAccent}"
+                        Padding="16,8" Margin="0,0,10,0"
+                        ToolTip="Register this task in Windows Task Scheduler"/>
+                <Button x:Name="SchedRefreshBtn" Content="_Refresh List" Style="{StaticResource Btn}"
+                        Padding="14,8" ToolTip="Reload scheduled tasks from Windows Task Scheduler"/>
               </StackPanel>
             </StackPanel>
           </Border>
 
+          <!-- Existing tasks list -->
           <Border Grid.Row="4" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -2660,20 +2890,21 @@ $xamlStr = @"
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
               </Grid.RowDefinitions>
-              <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
+              <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10"
+                      Background="#222225">
                 <Grid>
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="120"/>
-                    <ColumnDefinition Width="150"/>
-                    <ColumnDefinition Width="150"/>
-                    <ColumnDefinition Width="80"/>
+                    <ColumnDefinition Width="160"/>
+                    <ColumnDefinition Width="160"/>
+                    <ColumnDefinition Width="90"/>
                   </Grid.ColumnDefinitions>
-                  <TextBlock Grid.Column="0" Text="TASK NAME" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="1" Text="STATE" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="2" Text="NEXT RUN" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="3" Text="LAST RUN" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="4" Text="ACTION" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="0" Text="TASK NAME" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="1" Text="STATE" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="2" Text="NEXT RUN" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="3" Text="LAST RUN" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="4" Text="ACTION" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Grid>
               </Border>
               <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
@@ -2689,11 +2920,12 @@ $xamlStr = @"
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="220"/>
             <ColumnDefinition Width="12"/>
-            <ColumnDefinition Width="220"/>
+            <ColumnDefinition Width="240"/>
             <ColumnDefinition Width="12"/>
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
 
+          <!-- Open workbooks list -->
           <Border Grid.Column="0" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -2703,17 +2935,20 @@ $xamlStr = @"
                 <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
               <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                <TextBlock Text="OPEN WORKBOOKS" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <TextBlock Text="OPEN WORKBOOKS" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"
+                           ToolTip="All Excel workbooks currently open. Click to see its sheets."/>
               </Border>
               <ListBox Grid.Row="1" x:Name="NavWbList" Background="Transparent"
-                       Foreground="#FFFFFF" BorderThickness="0" Padding="4" FontSize="12"/>
+                       Foreground="#FFFFFF" BorderThickness="0" Padding="6,4" FontSize="12"/>
               <Border Grid.Row="2" BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="10,8">
-                <Button x:Name="NavRefreshBtn" Content="_Refresh" Style="{StaticResource Btn}"
-                        Padding="10,5" HorizontalAlignment="Stretch"/>
+                <Button x:Name="NavRefreshBtn" Content="_Refresh Workbooks" Style="{StaticResource Btn}"
+                        Padding="10,6" HorizontalAlignment="Stretch"
+                        ToolTip="Reload the list of open workbooks from Excel"/>
               </Border>
             </Grid>
           </Border>
 
+          <!-- Sheets list for selected workbook -->
           <Border Grid.Column="2" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -2723,29 +2958,39 @@ $xamlStr = @"
                 <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
               <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                <TextBlock Text="SHEETS (multi-select + drag reorder + Ctrl+E rename)" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <StackPanel>
+                  <TextBlock Text="WORKSHEETS" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Text="Multi-select   •   Drag to reorder   •   Ctrl+E to rename"
+                             Foreground="#6E6E6E" FontSize="10" Margin="0,3,0,0"/>
+                </StackPanel>
               </Border>
               <ListBox Grid.Row="1" x:Name="NavSheetList" Background="Transparent"
-                       Foreground="#FFFFFF" BorderThickness="0" Padding="4" FontSize="12"
-                       SelectionMode="Extended" AllowDrop="True"/>
-              <Border Grid.Row="2" BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="10,6">
-                <TextBlock x:Name="NavSheetCount" Text="0 sheets" Foreground="#6E6E6E" FontSize="10" HorizontalAlignment="Center"/>
+                       Foreground="#FFFFFF" BorderThickness="0" Padding="6,4" FontSize="12"
+                       SelectionMode="Extended" AllowDrop="True"
+                       ToolTip="Select one or more sheets. Drag to reorder. Press Ctrl+E to rename."/>
+              <Border Grid.Row="2" BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="10,8">
+                <TextBlock x:Name="NavSheetCount" Text="0 sheets" Foreground="#909090"
+                           FontSize="11" HorizontalAlignment="Center"/>
               </Border>
             </Grid>
           </Border>
 
+          <!-- Navigator right-panel actions -->
           <Border Grid.Column="4" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,16">
               <StackPanel>
 
-                <TextBlock Text="ACTIVATE" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                <TextBlock Text="ACTIVATE / OPEN" Foreground="#A0A0A0" FontSize="11"
+                           FontWeight="SemiBold" Margin="0,0,0,10"/>
                 <Button x:Name="NavActivateBtn" Content="_Activate Selected Sheet"
                         Style="{StaticResource BtnAccent}" Padding="14,8" Margin="0,0,0,6"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Switch Excel focus to the selected sheet"/>
                 <Button x:Name="NavOpenBtn" Content="_Open Workbook File..."
-                        Style="{StaticResource Btn}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
+                        Style="{StaticResource Btn}" Padding="14,8" Margin="0,0,0,8"
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Browse for and open an Excel file"/>
                 <Grid Margin="0,0,0,16">
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -2754,32 +2999,39 @@ $xamlStr = @"
                     <ColumnDefinition Width="8"/>
                     <ColumnDefinition Width="*"/>
                   </Grid.ColumnDefinitions>
-                  <Button Grid.Column="0" x:Name="NavBringFrontBtn" Content="_Bring Forward"
-                          Style="{StaticResource Btn}" Padding="10,6" HorizontalAlignment="Stretch"/>
-                  <Button Grid.Column="2" x:Name="NavMinimizeBtn" Content="Mi_nimize"
-                          Style="{StaticResource Btn}" Padding="10,6" HorizontalAlignment="Stretch"/>
+                  <Button Grid.Column="0" x:Name="NavBringFrontBtn" Content="_Bring to Front"
+                          Style="{StaticResource Btn}" Padding="8,6" HorizontalAlignment="Stretch"
+                          ToolTip="Bring the Excel window to the foreground"/>
+                  <Button Grid.Column="2" x:Name="NavMinimizeBtn" Content="_Minimize"
+                          Style="{StaticResource Btn}" Padding="8,6" HorizontalAlignment="Stretch"
+                          ToolTip="Minimize the Excel window"/>
                   <Button Grid.Column="4" x:Name="NavCloseWbBtn" Content="_Close Workbook"
-                          Style="{StaticResource BtnRed}" Padding="10,6" HorizontalAlignment="Stretch"/>
+                          Style="{StaticResource BtnRed}" Padding="8,6" HorizontalAlignment="Stretch"
+                          ToolTip="Close the selected workbook (prompts to save if unsaved)"/>
                 </Grid>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="MOVE / COPY SHEET" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="MOVE / COPY SHEET" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
-                <TextBlock Text="Destination Workbook" Foreground="#B0B0B0" FontSize="10" Margin="0,0,0,4"/>
-                <ComboBox x:Name="NavDestWbCombo" Margin="0,0,0,8"/>
-                <TextBlock Text="Insert Before Sheet" Foreground="#B0B0B0" FontSize="10" Margin="0,0,0,4"/>
+                <TextBlock Text="Destination Workbook" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,5"/>
+                <ComboBox x:Name="NavDestWbCombo" Margin="0,0,0,10"
+                          ToolTip="The workbook to move or copy the sheet into"/>
+                <TextBlock Text="Insert Before Sheet" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,5"
+                           ToolTip="The sheet will be inserted before this one (leave blank to move to end)"/>
                 <ComboBox x:Name="NavDestSheetCombo" Margin="0,0,0,8"/>
-                <CheckBox x:Name="NavCopyChk" Content="Copy (keep original)" Foreground="#FFFFFF"
-                          IsChecked="True" Margin="0,0,0,8" FontSize="11"/>
-                <Button x:Name="NavMoveCopyBtn" Content="_Move / Copy"
-                        Style="{StaticResource BtnAccent}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
-                <Button x:Name="NavExportSheetBtn" Content="E_xport Selected Sheet..."
+                <CheckBox x:Name="NavCopyChk" Content="Copy (keep original in source workbook)"
+                          Foreground="#FFFFFF" IsChecked="True" Margin="0,0,0,10" FontSize="11"/>
+                <Button x:Name="NavMoveCopyBtn" Content="_Move / Copy Sheet"
+                        Style="{StaticResource BtnAccent}" Padding="14,8" Margin="0,0,0,6"
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Move or copy the selected sheet(s) to the destination workbook"/>
+                <Button x:Name="NavExportSheetBtn" Content="E_xport Sheet to CSV/XLSX..."
                         Style="{StaticResource Btn}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Export the selected sheet as a standalone file"/>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="VISIBILITY" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="VISIBILITY" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <Grid Margin="0,0,0,16">
                   <Grid.ColumnDefinitions>
@@ -2787,59 +3039,68 @@ $xamlStr = @"
                     <ColumnDefinition Width="8"/>
                     <ColumnDefinition Width="*"/>
                   </Grid.ColumnDefinitions>
-                  <Button Grid.Column="0" x:Name="NavHideBtn" Content="_Hide"
-                          Style="{StaticResource Btn}" Padding="14,8" HorizontalAlignment="Stretch"/>
-                  <Button Grid.Column="2" x:Name="NavUnhideBtn" Content="_Unhide"
-                          Style="{StaticResource BtnGreen}" Padding="14,8" HorizontalAlignment="Stretch"/>
+                  <Button Grid.Column="0" x:Name="NavHideBtn" Content="_Hide Sheet"
+                          Style="{StaticResource Btn}" Padding="14,8" HorizontalAlignment="Stretch"
+                          ToolTip="Hide the selected sheets"/>
+                  <Button Grid.Column="2" x:Name="NavUnhideBtn" Content="_Unhide Sheet"
+                          Style="{StaticResource BtnGreen}" Padding="14,8" HorizontalAlignment="Stretch"
+                          ToolTip="Unhide hidden sheets in the selected workbook"/>
                 </Grid>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="DELETE" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="DELETE" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <Button x:Name="NavDeleteBtn" Content="_Delete Selected Sheets"
                         Style="{StaticResource BtnRed}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Permanently delete the selected sheets (cannot be undone)"/>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="PASSWORD PROTECTION" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="PASSWORD PROTECTION" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
-                <TextBlock Text="Password" Foreground="#B0B0B0" FontSize="10" Margin="0,0,0,4"/>
+                <TextBlock Text="Password" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,5"/>
                 <TextBox x:Name="NavPwdBox" FontSize="12" Foreground="#FFFFFF" Background="#1B1B1F"
-                         BorderBrush="#3E3E42" BorderThickness="1" Padding="6,5" Margin="0,0,0,8"/>
+                         BorderBrush="#3E3E42" BorderThickness="1" Padding="8,6" Margin="0,0,0,8"
+                         ToolTip="Enter the password to set, remove, or use when opening a protected workbook"/>
                 <Button x:Name="NavSetPwdBtn" Content="Set _Password on Workbook"
                         Style="{StaticResource BtnAccent}" Padding="14,8" Margin="0,0,0,6"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Protect the active workbook with the password above"/>
                 <Button x:Name="NavRemPwdBtn" Content="_Remove Password"
                         Style="{StaticResource Btn}" Padding="14,8" Margin="0,0,0,6"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Remove the password from the active workbook"/>
                 <Button x:Name="NavOpenPwdBtn" Content="Open _With Password..."
                         Style="{StaticResource Btn}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Open a password-protected workbook file"/>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="EXCEL ENGINE OPTIONS" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="EXCEL ENGINE OPTIONS" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
-                <TextBlock Text="Calculation Mode" Foreground="#B0B0B0" FontSize="10" Margin="0,0,0,4"/>
-                <ComboBox x:Name="NavCalcModeCombo" Margin="0,0,0,6">
+                <TextBlock Text="Calculation Mode" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,5"/>
+                <ComboBox x:Name="NavCalcModeCombo" Margin="0,0,0,8">
                   <ComboBoxItem Content="Automatic" IsSelected="True"/>
                   <ComboBoxItem Content="Manual"/>
                   <ComboBoxItem Content="Semiautomatic"/>
                 </ComboBox>
-                <CheckBox x:Name="NavEventsChk" Content="Events enabled" Foreground="#FFFFFF"
-                          IsChecked="True" Margin="0,0,0,8" FontSize="11"/>
+                <CheckBox x:Name="NavEventsChk" Content="Enable worksheet events"
+                          Foreground="#FFFFFF" IsChecked="True" Margin="0,0,0,10" FontSize="11"
+                          ToolTip="Toggle Excel's event system (disable to suppress change/calculate triggers)"/>
                 <Button x:Name="NavApplyExcelOptsBtn" Content="_Apply Excel Options"
                         Style="{StaticResource BtnAccent}" Padding="14,8" Margin="0,0,0,16"
-                        HorizontalAlignment="Stretch"/>
+                        HorizontalAlignment="Stretch"
+                        ToolTip="Apply the calculation mode and events setting to the active Excel session"/>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="VBA MODULES / MACROS" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="VBA MODULES / MACROS" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <ListBox x:Name="NavVbaList" Height="120" Background="#1B1B1F" Foreground="#C0C0C0"
                          BorderBrush="#3E3E42" BorderThickness="1" Margin="0,0,0,16" FontSize="11"
                          ToolTip="Right-click a macro entry to run it in the selected navigator workbook."/>
 
-                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,8">
-                  <TextBlock Text="QUICK INFO" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <Border BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,0,0,10">
+                  <TextBlock Text="WORKBOOK INFO" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <TextBox x:Name="NavInfoTxt" IsReadOnly="True" Height="140"
                          TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
@@ -2860,6 +3121,7 @@ $xamlStr = @"
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
 
+          <!-- Saved templates list (left panel) -->
           <Border Grid.Column="0" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -2869,52 +3131,71 @@ $xamlStr = @"
                 <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
               <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                <TextBlock Text="SAVED TEMPLATES" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                <TextBlock Text="SAVED TEMPLATES" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"
+                           ToolTip="Click a template to load it into the editor on the right"/>
               </Border>
               <ListBox Grid.Row="1" x:Name="TplList" Background="Transparent"
-                       Foreground="#FFFFFF" BorderThickness="0" Padding="4" FontSize="12"/>
+                       Foreground="#FFFFFF" BorderThickness="0" Padding="6,4" FontSize="12"/>
               <Border Grid.Row="2" BorderBrush="#3E3E42" BorderThickness="0,1,0,0" Padding="10,8">
-                <Button x:Name="TplDeleteBtn" Content="_Delete Selected" Style="{StaticResource BtnRed}"
-                        Padding="10,5" HorizontalAlignment="Stretch"/>
+                <Button x:Name="TplDeleteBtn" Content="_Delete Selected Template"
+                        Style="{StaticResource BtnRed}" Padding="10,6" HorizontalAlignment="Stretch"
+                        ToolTip="Permanently delete the selected template"/>
               </Border>
             </Grid>
           </Border>
 
+          <!-- Template editor (right panel) -->
           <Border Grid.Column="2" Background="#252528" CornerRadius="6"
-                  BorderBrush="#3E3E42" BorderThickness="1" Padding="20,16">
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="20,18">
             <Grid>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="8"/>
+                <RowDefinition Height="10"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="8"/>
+                <RowDefinition Height="6"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="6"/>
                 <RowDefinition Height="*"/>
-                <RowDefinition Height="12"/>
+                <RowDefinition Height="14"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition Height="8"/>
+                <RowDefinition Height="10"/>
                 <RowDefinition Height="Auto"/>
               </Grid.RowDefinitions>
 
-              <TextBlock Grid.Row="0" Text="TEMPLATE EDITOR" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-              <TextBox Grid.Row="2" x:Name="TplNameBox" ToolTip="Template name"/>
-              <TextBox Grid.Row="4" x:Name="TplContentBox" AcceptsReturn="True"
-                       TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
-                       ToolTip="Template content - use {DATE}, {SHEET}, {USER} placeholders"
+              <TextBlock Grid.Row="0" Text="TEMPLATE EDITOR" Foreground="#A0A0A0"
+                         FontSize="11" FontWeight="SemiBold"/>
+
+              <TextBlock Grid.Row="2" Text="Template Name" Foreground="#B0B0B0" FontSize="12"/>
+              <TextBox Grid.Row="4" x:Name="TplNameBox"
+                       ToolTip="A short identifying name for this template"/>
+
+              <TextBlock Grid.Row="6" Text="Template Content" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Top" Margin="0,0,0,6"/>
+              <TextBox Grid.Row="6" x:Name="TplContentBox" AcceptsReturn="True"
+                       TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Margin="0,22,0,0"
+                       ToolTip="Template body — use {DATE}, {SHEET}, or {USER} as dynamic placeholders"
                        FontFamily="Consolas" FontSize="11"/>
-              <StackPanel Grid.Row="6" Orientation="Horizontal">
+
+              <StackPanel Grid.Row="8" Orientation="Horizontal">
                 <Button x:Name="TplSaveBtn" Content="_Save Template" Style="{StaticResource BtnAccent}"
-                        Padding="14,7" Margin="0,0,10,0"/>
+                        Padding="14,8" Margin="0,0,10,0"
+                        ToolTip="Save this template (creates new or updates existing by name)"/>
                 <Button x:Name="TplPasteBtn" Content="_Paste to Excel" Style="{StaticResource BtnGreen}"
-                        Padding="14,7" Margin="0,0,10,0"/>
+                        Padding="14,8" Margin="0,0,10,0"
+                        ToolTip="Paste this template's content into the active Excel cell (substitutes placeholders)"/>
                 <Button x:Name="TplPreviewBtn" Content="Pre_view" Style="{StaticResource Btn}"
-                        Padding="14,7"/>
+                        Padding="14,8"
+                        ToolTip="Show a preview of the template with placeholders substituted"/>
               </StackPanel>
-              <Border Grid.Row="8" x:Name="TplPreviewCard" Visibility="Collapsed"
-                      Background="#1E2D1E" CornerRadius="6" BorderBrush="#50A050" BorderThickness="1" Padding="12,10">
+
+              <Border Grid.Row="10" x:Name="TplPreviewCard" Visibility="Collapsed"
+                      Background="#1E2D1E" CornerRadius="6" BorderBrush="#50A050"
+                      BorderThickness="1" Padding="14,12">
                 <StackPanel>
-                  <TextBlock Text="PREVIEW" Foreground="#50A050" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                  <TextBlock Text="PREVIEW — placeholder values substituted" Foreground="#50A050"
+                             FontSize="11" FontWeight="SemiBold" Margin="0,0,0,8"/>
                   <TextBox x:Name="TplPreviewTxt" IsReadOnly="True" FontFamily="Consolas" FontSize="11"
-                           AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="150"
+                           AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="160"
                            VerticalScrollBarVisibility="Auto" Background="#1B1B1F" Foreground="#FFFFFF"
                            BorderThickness="0"/>
                 </StackPanel>
@@ -2928,12 +3209,14 @@ $xamlStr = @"
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="24,18" MaxWidth="900">
 
+            <!-- Quarter folder comparison setup -->
             <Border Background="#252528" CornerRadius="6" BorderBrush="#3E3E42"
                     BorderThickness="1" Padding="20,16" Margin="0,0,0,12">
               <StackPanel>
-                <TextBlock Text="QUARTER FOLDER SETUP" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,4"/>
-                <TextBlock Text="Run once per quarter to compare folders and build the initial to-do checklist."
-                           Foreground="#8B8B8F" FontSize="11" FontStyle="Italic" Margin="0,0,0,12"/>
+                <TextBlock Text="QUARTER FOLDER SYNC" Foreground="#A0A0A0" FontSize="11"
+                           FontWeight="SemiBold" Margin="0,0,0,6"/>
+                <TextBlock Text="Compare last quarter's folder structure against this quarter to build a new to-do checklist. Run once at the start of each quarter."
+                           Foreground="#909090" FontSize="11" FontStyle="Italic" Margin="0,0,0,14"/>
 
                 <TextBlock Text="Quarter Name" Foreground="#B0B0B0" FontSize="12" Margin="0,0,0,6"/>
                 <TextBox x:Name="QsSyncQuarterName" ToolTip="e.g. Q1 2025" Margin="0,0,0,12"/>
@@ -3053,7 +3336,7 @@ $xamlStr = @"
                   <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                  <TextBlock Text="COMPLETION BY FOLDER" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                  <TextBlock Text="COMPLETION BY FOLDER" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" MaxHeight="200">
                   <StackPanel x:Name="QsFolderBars" Margin="14,8,14,10"/>
@@ -3068,7 +3351,7 @@ $xamlStr = @"
                   <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10">
-                  <TextBlock Text="SYNC LOG" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                  <TextBlock Text="SYNC LOG" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Border>
                 <TextBox Grid.Row="1" x:Name="QsSyncLogTxt" Height="140" IsReadOnly="True"
                          TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
@@ -3087,118 +3370,152 @@ $xamlStr = @"
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="10"/>
-            <RowDefinition Height="Auto"/>
             <RowDefinition Height="12"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="14"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
 
+          <!-- Folder pair selector (compare Source A vs Folder B) -->
           <Border Grid.Row="0" Background="#252528" CornerRadius="6"
-                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="16,12">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="290"/>
                 <ColumnDefinition Width="10"/>
-                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="290"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="24"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="14"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="200"/>
+                <ColumnDefinition Width="14"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="180"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <TextBlock Grid.Column="0" Text="Source A" Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center"/>
+
+              <!-- Source A folder -->
+              <TextBlock Grid.Column="0" Text="Folder A (baseline)" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center" ToolTip="The reference folder — usually last quarter"/>
               <ComboBox  Grid.Column="2" x:Name="QsQuarterCombo" VerticalAlignment="Center" IsEditable="True"
-                         ToolTip="Folder A (baseline source)"/>
-              <TextBlock Grid.Column="4" Text="vs" Foreground="#4C9FE6" FontSize="12" FontWeight="Bold" VerticalAlignment="Center"/>
-              <ComboBox  Grid.Column="6" x:Name="QsCompareCombo" VerticalAlignment="Center" IsEditable="True"
-                         ToolTip="Folder B (delivery/target)"/>
-              <Button Grid.Column="8" x:Name="QsNewQuarterBtn" Content="Browse _A" Style="{StaticResource Btn}" Padding="10,5"/>
-              <Button Grid.Column="10" x:Name="QsScanFolderBtn" Content="Browse _B" Style="{StaticResource Btn}" Padding="10,5"/>
-              <Button Grid.Column="12" x:Name="QsAddTaskBtn" Content="_Compare Missing" Style="{StaticResource BtnAccent}" Padding="10,5"/>
-              <TextBox Grid.Column="14" x:Name="QsScanPathBox" ToolTip="Optional compare tag (saved in note)"/>
-              <TextBlock Grid.Column="16" x:Name="QsQuarterSummary" Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center"/>
-              <TextBlock Grid.Column="18" x:Name="QsQuarterPct" Foreground="#4C9FE6" FontSize="12" FontWeight="Bold" VerticalAlignment="Center"/>
-              <Button Grid.Column="20" x:Name="QsSwapFoldersBtn" Content="_Swap" Style="{StaticResource Btn}" Padding="10,5"/>
+                         ToolTip="Type or browse to the baseline (source) folder path"/>
+              <Button    Grid.Column="4" x:Name="QsNewQuarterBtn" Content="_Browse A"
+                         Style="{StaticResource Btn}" Padding="10,5"
+                         ToolTip="Browse for Folder A (baseline)"/>
+
+              <!-- VS separator -->
+              <TextBlock Grid.Column="5" Text="vs" Foreground="#4C9FE6" FontSize="13" FontWeight="Bold"
+                         VerticalAlignment="Center" HorizontalAlignment="Center"/>
+
+              <!-- Folder B -->
+              <TextBlock Grid.Column="6" Text="Folder B (target)" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center" ToolTip="The delivery or current-quarter folder"/>
+              <ComboBox  Grid.Column="8" x:Name="QsCompareCombo" VerticalAlignment="Center" IsEditable="True"
+                         ToolTip="Type or browse to the target (delivery) folder path"/>
+              <Button    Grid.Column="10" x:Name="QsScanFolderBtn" Content="_Browse B"
+                         Style="{StaticResource Btn}" Padding="10,5"
+                         ToolTip="Browse for Folder B (target)"/>
+
+              <!-- Compare action + tag -->
+              <Button    Grid.Column="12" x:Name="QsAddTaskBtn" Content="_Find Missing Files"
+                         Style="{StaticResource BtnAccent}" Padding="12,5"
+                         ToolTip="Compare Folder A vs Folder B and add any missing files as to-do items"/>
+              <TextBox   Grid.Column="14" x:Name="QsScanPathBox"
+                         ToolTip="Optional tag or note saved with compared items (e.g. 'Q1 delivery')"/>
+
+              <!-- Summary + swap -->
+              <TextBlock Grid.Column="16" x:Name="QsQuarterSummary" Foreground="#909090"
+                         FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+              <TextBlock Grid.Column="17" x:Name="QsQuarterPct" Foreground="#4C9FE6"
+                         FontSize="13" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0"/>
+              <Button    Grid.Column="18" x:Name="QsSwapFoldersBtn" Content="⇄ _Swap"
+                         Style="{StaticResource Btn}" Padding="10,5"
+                         ToolTip="Swap Folder A and Folder B"/>
             </Grid>
           </Border>
 
+          <!-- Add task inline form (hidden until triggered) -->
           <Border Grid.Row="1" x:Name="QsAddTaskCard" Visibility="Collapsed"
-                  Background="#2A2A2E" CornerRadius="6" BorderBrush="#3E3E42"
+                  Background="#2A2A2E" CornerRadius="6" BorderBrush="#4C9FE6"
                   BorderThickness="1" Padding="14,10" Margin="0,8,0,0">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="160"/>
-                <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="100"/>
-                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="130"/>
+                <ColumnDefinition Width="10"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
               <TextBox Grid.Column="0" x:Name="QsNewTaskName" ToolTip="File or task name"/>
-              <TextBox Grid.Column="2" x:Name="QsNewTaskFolder" ToolTip="Folder (optional)"/>
-              <TextBox Grid.Column="4" x:Name="QsNewTaskDue" ToolTip="Due date yyyy-MM-dd"/>
-              <Button Grid.Column="6" x:Name="QsSaveTaskBtn" Content="Sa_ve" Style="{StaticResource BtnAccent}" Padding="10,5"/>
-              <Button Grid.Column="8" x:Name="QsCancelTaskBtn" Content="_Cancel" Style="{StaticResource Btn}" Padding="10,5"/>
+              <TextBox Grid.Column="2" x:Name="QsNewTaskFolder" ToolTip="Subfolder (optional)"/>
+              <TextBox Grid.Column="4" x:Name="QsNewTaskDue" ToolTip="Due date (yyyy-MM-dd)"/>
+              <Button Grid.Column="6" x:Name="QsSaveTaskBtn" Content="_Save Task"
+                      Style="{StaticResource BtnAccent}" Padding="12,5"/>
+              <Button Grid.Column="8" x:Name="QsCancelTaskBtn" Content="_Cancel"
+                      Style="{StaticResource Btn}" Padding="12,5"/>
             </Grid>
           </Border>
 
+          <!-- Filter bar -->
           <Border Grid.Row="3" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="110"/>
-                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="120"/>
+                <ColumnDefinition Width="16"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="160"/>
-                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="16"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="8"/>
-                <ColumnDefinition Width="160"/>
+                <ColumnDefinition Width="180"/>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
 
-              <TextBlock Grid.Column="0" Text="Status" Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="0" Text="Status" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center"/>
               <ComboBox  Grid.Column="2" x:Name="QsFltStatus" VerticalAlignment="Center">
                 <ComboBoxItem Content="All" IsSelected="True"/>
                 <ComboBoxItem Content="Pending"/>
                 <ComboBoxItem Content="Done"/>
               </ComboBox>
 
-              <TextBlock Grid.Column="4" Text="File" Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center"/>
-              <TextBox   Grid.Column="6" x:Name="QsFltName" ToolTip="Filter by file name"/>
+              <TextBlock Grid.Column="4" Text="File name" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center"/>
+              <TextBox   Grid.Column="6" x:Name="QsFltName" ToolTip="Filter results by file name (partial match)"/>
 
-              <TextBlock Grid.Column="8" Text="Folder" Foreground="#6E6E6E" FontSize="11" VerticalAlignment="Center"/>
-              <TextBox   Grid.Column="10" x:Name="QsFltFolder" ToolTip="Filter by folder"/>
+              <TextBlock Grid.Column="8" Text="Folder" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center"/>
+              <TextBox   Grid.Column="10" x:Name="QsFltFolder" ToolTip="Filter results by folder name (partial match)"/>
 
               <Button Grid.Column="12" x:Name="QsExportBtn" Content="_Export to Excel"
-                      Style="{StaticResource BtnAccent}" Padding="12,6"/>
+                      Style="{StaticResource BtnAccent}" Padding="12,6"
+                      ToolTip="Export the current task list to an Excel workbook"/>
               <Button Grid.Column="14" x:Name="QsRefreshBtn" Content="_Refresh"
-                      Style="{StaticResource Btn}" Padding="12,6"/>
+                      Style="{StaticResource Btn}" Padding="12,6"
+                      ToolTip="Reload the task list applying current filters"/>
             </Grid>
           </Border>
 
+          <!-- Task list grid -->
           <Border Grid.Row="5" Background="#252528" CornerRadius="6"
                   BorderBrush="#3E3E42" BorderThickness="1">
             <Grid>
@@ -3207,21 +3524,24 @@ $xamlStr = @"
                 <RowDefinition Height="*"/>
               </Grid.RowDefinitions>
 
+              <!-- Column headers -->
               <Border Grid.Row="0" BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,10"
                       Background="#222225">
                 <Grid>
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="160"/>
-                    <ColumnDefinition Width="100"/>
-                    <ColumnDefinition Width="100"/>
-                    <ColumnDefinition Width="200"/>
+                    <ColumnDefinition Width="180"/>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="210"/>
                   </Grid.ColumnDefinitions>
-                  <TextBlock Grid.Column="0" Text="FILE NAME" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="1" Text="FOLDER" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="2" Text="ADDED IN A" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="3" Text="UPDATED IN A" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
-                  <TextBlock Grid.Column="4" Text="ACTIONS" Foreground="#6E6E6E" FontSize="10" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="0" Text="FILE NAME" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="1" Text="FOLDER" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
+                  <TextBlock Grid.Column="2" Text="NEW IN A" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"
+                             ToolTip="File was added since the last quarter baseline"/>
+                  <TextBlock Grid.Column="3" Text="CHANGED IN A" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"
+                             ToolTip="File was modified since the last quarter baseline"/>
+                  <TextBlock Grid.Column="4" Text="ACTIONS" Foreground="#A0A0A0" FontSize="11" FontWeight="SemiBold"/>
                 </Grid>
               </Border>
 
@@ -3233,6 +3553,159 @@ $xamlStr = @"
         </Grid>
       </TabItem>
 
+      <!-- ═══════════════════════════════════════════════════════════ -->
+      <!-- FILE INDEX TAB — DLP-safe metadata-only drive search       -->
+      <!-- ═══════════════════════════════════════════════════════════ -->
+      <TabItem Header="File Index">
+        <Grid Margin="24,18">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <!-- Root folder selector + index controls -->
+          <Border Grid.Row="0" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="16,12">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="Root Folder" Foreground="#B0B0B0" FontSize="12"
+                         VerticalAlignment="Center"
+                         ToolTip="The folder to scan for file metadata. Subfolders are included."/>
+              <TextBox   Grid.Column="2" x:Name="FidxRootBox"
+                         ToolTip="Type or paste a folder path, then click Index Now to scan it"/>
+              <Button    Grid.Column="4" x:Name="FidxBrowseBtn" Content="_Browse..."
+                         Style="{StaticResource Btn}" Padding="12,5"
+                         ToolTip="Open a folder picker dialog"/>
+              <Button    Grid.Column="6" x:Name="FidxIndexBtn" Content="_Index Now"
+                         Style="{StaticResource BtnAccent}" Padding="14,5"
+                         ToolTip="Scan the root folder and cache file metadata (60-minute cooldown after each scan)"/>
+              <TextBlock Grid.Column="8" x:Name="FidxCooldownTxt" Foreground="#909090"
+                         FontSize="11" VerticalAlignment="Center"
+                         ToolTip="Time remaining before next scan is allowed"/>
+            </Grid>
+          </Border>
+
+          <!-- Search bar -->
+          <Border Grid.Row="2" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBox Grid.Column="0" x:Name="FidxSearchBox" FontSize="13"
+                       ToolTip="Filter by file name, folder path, or extension — results update as you type"/>
+              <TextBlock Grid.Column="2" x:Name="FidxMatchCount" Foreground="#4C9FE6"
+                         FontSize="12" FontWeight="Bold" VerticalAlignment="Center"
+                         ToolTip="Number of files matching the current search"/>
+            </Grid>
+          </Border>
+
+          <!-- Results DataGrid -->
+          <Border Grid.Row="4" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1">
+            <DataGrid x:Name="FidxGrid"
+                      AutoGenerateColumns="False"
+                      IsReadOnly="True"
+                      SelectionMode="Single"
+                      GridLinesVisibility="Horizontal"
+                      Background="Transparent"
+                      RowBackground="#252528"
+                      AlternatingRowBackground="#202023"
+                      Foreground="#FFFFFF"
+                      BorderThickness="0"
+                      ColumnHeaderHeight="32"
+                      RowHeight="26"
+                      FontSize="12"
+                      CanUserReorderColumns="True"
+                      CanUserResizeColumns="True"
+                      CanUserSortColumns="True"
+                      HeadersVisibility="Column"
+                      ToolTip="Double-click or press Enter to open a file. Click a column header to sort.">
+              <DataGrid.Resources>
+                <Style TargetType="DataGridColumnHeader">
+                  <Setter Property="Background"   Value="#222225"/>
+                  <Setter Property="Foreground"   Value="#A0A0A0"/>
+                  <Setter Property="FontSize"     Value="11"/>
+                  <Setter Property="FontWeight"   Value="SemiBold"/>
+                  <Setter Property="Padding"      Value="10,0"/>
+                  <Setter Property="BorderBrush"  Value="#3E3E42"/>
+                  <Setter Property="BorderThickness" Value="0,0,1,1"/>
+                </Style>
+                <Style TargetType="DataGridRow">
+                  <Setter Property="BorderThickness" Value="0"/>
+                  <Style.Triggers>
+                    <Trigger Property="IsSelected" Value="True">
+                      <Setter Property="Background" Value="#1A2A3E"/>
+                    </Trigger>
+                    <Trigger Property="IsMouseOver" Value="True">
+                      <Setter Property="Background" Value="#2D2D30"/>
+                    </Trigger>
+                  </Style.Triggers>
+                </Style>
+                <Style TargetType="DataGridCell">
+                  <Setter Property="BorderThickness" Value="0"/>
+                  <Setter Property="Padding"         Value="8,0"/>
+                  <Style.Triggers>
+                    <Trigger Property="IsSelected" Value="True">
+                      <Setter Property="Background"  Value="Transparent"/>
+                      <Setter Property="Foreground"  Value="#FFFFFF"/>
+                    </Trigger>
+                  </Style.Triggers>
+                </Style>
+              </DataGrid.Resources>
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="File Name" Binding="{Binding Name}"   Width="220"/>
+                <DataGridTextColumn Header="Path"      Binding="{Binding Path}"   Width="*"/>
+                <DataGridTextColumn Header="Size"      Binding="{Binding SizeStr}" Width="80"/>
+                <DataGridTextColumn Header="Modified"  Binding="{Binding Modified}" Width="140"/>
+                <DataGridTextColumn Header="Ext"       Binding="{Binding Ext}"    Width="60"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </Border>
+
+          <!-- Status bar -->
+          <Border Grid.Row="5" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,8" Margin="0,8,0,0">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" x:Name="FidxStatusTxt"
+                         Foreground="#909090" FontSize="11" VerticalAlignment="Center"
+                         Text="No index loaded. Select a root folder and click Index Now."/>
+              <TextBlock Grid.Column="2" Text="Total files:" Foreground="#6E6E6E"
+                         FontSize="11" VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="3" x:Name="FidxTotalCount" Foreground="#B0B0B0"
+                         FontSize="11" FontWeight="Bold" VerticalAlignment="Center" Text="0"/>
+              <TextBlock Grid.Column="5" x:Name="FidxLastScanTxt" Foreground="#6E6E6E"
+                         FontSize="11" VerticalAlignment="Center"/>
+            </Grid>
+          </Border>
+
+        </Grid>
+      </TabItem>
+
     </TabControl>
 
     <Border Grid.Row="2" Background="#252528" BorderBrush="#3E3E42" BorderThickness="0,1,0,0">
@@ -3241,10 +3714,10 @@ $xamlStr = @"
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <TextBlock Grid.Column="0" x:Name="StatusBarTxt" Text="  Ready" Foreground="#6E6E6E"
-                   FontSize="11" VerticalAlignment="Center"/>
-        <TextBlock Grid.Column="1" x:Name="StatusClockTxt" Text="" Foreground="#6E6E6E"
-                   FontSize="11" VerticalAlignment="Center"/>
+        <TextBlock Grid.Column="0" x:Name="StatusBarTxt" Text="  Ready" Foreground="#B0B0B0"
+                   FontSize="12" VerticalAlignment="Center"/>
+        <TextBlock Grid.Column="1" x:Name="StatusClockTxt" Text="" Foreground="#909090"
+                   FontSize="12" VerticalAlignment="Center"/>
       </Grid>
     </Border>
 
@@ -3450,6 +3923,18 @@ $QsExportBtn       = G 'QsExportBtn'
 $QsRefreshBtn      = G 'QsRefreshBtn'
 $QsTodoPanel       = G 'QsTodoPanel'
 
+# -- File Index tab --
+$FidxRootBox       = G 'FidxRootBox'
+$FidxBrowseBtn     = G 'FidxBrowseBtn'
+$FidxIndexBtn      = G 'FidxIndexBtn'
+$FidxCooldownTxt   = G 'FidxCooldownTxt'
+$FidxSearchBox     = G 'FidxSearchBox'
+$FidxMatchCount    = G 'FidxMatchCount'
+$FidxGrid          = G 'FidxGrid'
+$FidxStatusTxt     = G 'FidxStatusTxt'
+$FidxTotalCount    = G 'FidxTotalCount'
+$FidxLastScanTxt   = G 'FidxLastScanTxt'
+
 # ================================================================
 #  SYNC LOG WRITER (appends to the QSync log textbox)
 # ================================================================
@@ -3460,28 +3945,8 @@ function QsLog([string]$msg) {
     Update-UI
 }
 
-# ================================================================
-#  REFRESH QUARTER DROPDOWN
-# ================================================================
-function Refresh-QuarterDropdown([string]$selectName) {
-    $qFiles = Get-QuarterList
-    $QsQuarterCombo.Items.Clear()
-    $QsCompareCombo.Items.Clear()
-    [void]($QsCompareCombo.Items.Add('(none)'))
-    foreach ($qf in $qFiles) {
-        [void]($QsQuarterCombo.Items.Add($qf.BaseName))
-        [void]($QsCompareCombo.Items.Add($qf.BaseName))
-    }
-    if ($selectName -and $QsQuarterCombo.Items.Contains($selectName)) {
-        $QsQuarterCombo.SelectedItem = $selectName
-    } elseif ($QsQuarterCombo.Items.Count -gt 0) {
-        $QsQuarterCombo.SelectedIndex = 0
-    }
-    $QsCompareCombo.SelectedIndex = 0
-    if ($QsQuarterCombo.SelectedItem) {
-        Switch-ActiveQuarter (Join-Path $script:QuartersDir "$($QsQuarterCombo.SelectedItem).json")
-    }
-}
+# (Refresh-QuarterDropdown was removed — QsQuarterCombo is now an editable path combo
+#  populated via Add-QsFolderHistoryItem and direct text entry, not JSON file names.)
 
 # ================================================================
 #  REFRESH FUNCTIONS: MacroHub tabs
@@ -5881,6 +6346,111 @@ $MainTabs.Add_SelectionChanged({
         2 { Refresh-TaskList }                                         # Scheduler (COM + WMI)
         3 { Refresh-NavWorkbooks; Refresh-NavSheets }                  # Navigator (Excel COM)
         6 { Refresh-QsTodoList; Refresh-QsProgress }                   # QTasks (JSON + UI build)
+        7 {                                                            # File Index (load from cache)
+            $cachedIdx = Load-FidxCache
+            if ($cachedIdx -and $cachedIdx.Items) {
+                $script:FidxAllItems = @($cachedIdx.Items)
+                $script:FidxLastScan = try { [datetime]::Parse($cachedIdx.ScannedOn) } catch { $null }
+                $FidxRootBox.Text    = [string]$cachedIdx.Root
+                $FidxTotalCount.Text = $script:FidxAllItems.Count
+                $FidxLastScanTxt.Text = "Last scanned: $($cachedIdx.ScannedOn)"
+                $FidxStatusTxt.Text  = "Index loaded from cache ($($script:FidxAllItems.Count) files)."
+                $FidxGrid.ItemsSource = $script:FidxAllItems
+                $FidxMatchCount.Text = "$($script:FidxAllItems.Count) files"
+                if ((Get-FidxCacheAgeSec) -lt $script:FidxCooldownSec) { Start-FidxCooldownTimer }
+            }
+        }
+    }
+})
+
+# ================================================================
+#  FILE INDEX EVENT HANDLERS
+# ================================================================
+
+# Helper: rebuild DataGrid from filtered results
+function Refresh-FidxGrid {
+    $q = if ($FidxSearchBox) { [string]$FidxSearchBox.Text } else { '' }
+    $filtered = Get-FidxFiltered -Query $q
+    $FidxGrid.ItemsSource = $filtered
+    $FidxMatchCount.Text  = "$($filtered.Count) files"
+}
+
+# Browse button — folder picker
+$FidxBrowseBtn.Add_Click({
+    $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
+    $dlg.Description = 'Select root folder to index'
+    if ($FidxRootBox.Text -and (Test-Path $FidxRootBox.Text -PathType Container)) {
+        $dlg.SelectedPath = $FidxRootBox.Text
+    }
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $FidxRootBox.Text = $dlg.SelectedPath
+    }
+})
+
+# Index Now button — scan and cache
+$FidxIndexBtn.Add_Click({
+    $root = $FidxRootBox.Text.Trim()
+    if (-not $root) {
+        [System.Windows.MessageBox]::Show('Enter a root folder path first.', 'File Index', 'OK', 'Information')
+        return
+    }
+    if (-not (Test-Path $root -PathType Container)) {
+        [System.Windows.MessageBox]::Show("Folder not found:`n$root", 'File Index', 'OK', 'Warning')
+        return
+    }
+    $FidxIndexBtn.IsEnabled  = $false
+    $FidxStatusTxt.Text      = 'Scanning… this may take a moment for large folders.'
+    $FidxStatusTxt.Foreground = HexBrush '#4C9FE6'
+    Update-UI
+
+    try {
+        Show-Busy 'Building file index…'
+        $items = Invoke-FidxScan -RootPath $root
+        $script:FidxAllItems = $items
+        $script:FidxLastScan = Get-Date
+        Save-FidxCache -Items $items -Root $root
+
+        $FidxTotalCount.Text  = $items.Count
+        $FidxLastScanTxt.Text = "Last scanned: $(Get-Date -f 'yyyy-MM-dd HH:mm')"
+        $FidxStatusTxt.Text   = "Index complete — $($items.Count) files in $(Split-Path $root -Leaf)."
+        $FidxStatusTxt.Foreground = HexBrush '#50A050'
+        Refresh-FidxGrid
+        Start-FidxCooldownTimer
+        Set-Status "File index built: $($items.Count) files"
+    } catch {
+        $FidxStatusTxt.Text = "Error: $_"
+        $FidxStatusTxt.Foreground = HexBrush '#E05050'
+        $FidxIndexBtn.IsEnabled = $true
+        Set-Status "File index error: $_" '#E05050'
+    } finally {
+        Hide-Busy
+    }
+})
+
+# Search box — real-time filter as user types
+$FidxSearchBox.Add_TextChanged({
+    if ($script:FidxAllItems.Count -gt 0) { Refresh-FidxGrid }
+})
+
+# DataGrid double-click — open selected file
+$FidxGrid.Add_MouseDoubleClick({
+    $item = $FidxGrid.SelectedItem
+    if ($item -and $item.Path -and (Test-Path $item.Path)) {
+        try { Start-Process $item.Path } catch {
+            Set-Status "Cannot open: $_" '#E05050'
+        }
+    }
+})
+
+# DataGrid Enter key — open selected file
+$FidxGrid.Add_KeyDown({
+    if ($_.Key -eq 'Return') {
+        $item = $FidxGrid.SelectedItem
+        if ($item -and $item.Path -and (Test-Path $item.Path)) {
+            try { Start-Process $item.Path } catch {
+                Set-Status "Cannot open: $_" '#E05050'
+            }
+        }
     }
 })
 
@@ -5890,7 +6460,7 @@ $script:TabsLoaded[1] = $true
 $script:TabsLoaded[4] = $true
 $script:TabsLoaded[5]  = $true
 
-Set-Status 'MacroHub v3.1 ready -- Ctrl+PgUp/PgDn tabs | Ctrl+0-9 | Alt+0-9 | Ctrl+F search'
+Set-Status 'MacroHub v3.2 ready — Ctrl+PgUp/PgDn tabs  |  Ctrl+0–9 jump  |  Ctrl+F search'
 
 # Check for missed scheduled tasks AFTER window is visible
 $Window.Add_ContentRendered({
