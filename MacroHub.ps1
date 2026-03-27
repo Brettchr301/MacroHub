@@ -4,17 +4,72 @@
     MacroHub v3.2 - Office Productivity Super App
 .DESCRIPTION
     Merged: MacroHub automation suite + QuarterSync quarterly tracker + File Index.
-    8 tabs: Clipboard | Macros | Scheduler | Navigator | Templates | QSync | QTasks | File Index
+    9 tabs: Clipboard | Macros | Scheduler | Navigator | Templates | QSync | QTasks | File Index | Formula Auditor
 
     Chrome/Teams dark-mode UI. Pure PowerShell 5.1 / WPF. No external modules.
 
     Color palette: black/grey/white text, blue accents, red for destructive only.
     Contrast: all labels ≥ #909090 on dark backgrounds for WCAG AA readability.
+
+    -----------------------------------------------------------------------
+    WHAT THIS FILE IS
+    -----------------------------------------------------------------------
+    MacroHub is a single-window WPF desktop app that centralises common
+    Excel/Office automation workflows:
+      - Clipboard multi-slot capture and paste to Excel
+      - VBA (.bas) and PowerShell (.ps1) macro library runner
+      - Windows Task Scheduler integration for recurring macros
+      - Excel workbook/sheet navigator (rename, move, hide, export, VBA runner)
+      - Reusable text template library
+      - QuarterSync: folder structure replication quarter-to-quarter
+      - QTasks: folder-comparison deliverables tracker with Excel export
+
+    -----------------------------------------------------------------------
+    HOW THE APP IS STRUCTURED
+    -----------------------------------------------------------------------
+    Single WPF Window containing a TabControl with 9 tabs:
+      Tab 0 = Clipboard   -- multi-slot clipboard recording and paste to Excel
+      Tab 1 = Macros      -- discover and run .bas/.ps1 macros from the Macros/ folder
+      Tab 2 = Scheduler   -- create/remove Windows Task Scheduler entries (\MacroHub)
+      Tab 3 = Navigator   -- manage workbooks and sheets in a Navigator Excel session
+      Tab 4 = Templates   -- save/load/paste reusable text snippets
+      Tab 5 = QSync       -- copy last-quarter folder structure to this quarter
+      Tab 6 = QTasks      -- compare two folders and track missing deliverables
+      Tab 7 = File Index  -- DLP-safe metadata-only drive search
+      Tab 8 = Formula Auditor -- read-only formula inspection and temp highlighting
+
+    -----------------------------------------------------------------------
+    CODE ORGANIZATION (top to bottom)
+    -----------------------------------------------------------------------
+    1.  ASSEMBLIES        -- Add-Type for WPF, Windows.Forms, System.Drawing
+    2.  CONFIGURATION     -- $script: path/file globals and version constant
+    3.  GLOBAL STATE      -- runtime state variables (slots, timers, COM refs)
+    4.  HELPER FUNCTIONS  -- HexBrush, Write-ActivityLog, Normalize-List, UI helpers
+    5.  EXCEL COM HELPERS -- Get-ExcelApp, workbook/worksheet accessors
+    6.  MACRO DISCOVERY   -- Get-MacroFiles scans the Macros/ folder
+    7.  MACRO EXECUTION   -- Invoke-VbaMacro / Invoke-PsScript / Invoke-SelectedMacro
+    8.  TASK SCHEDULER    -- Get/Register/Remove-HubTask via Schedule.Service COM
+    9.  CLIPBOARD HELPERS -- Get-ClipboardPacket, dimensions, matrix, Paste-ClipboardPacketToExcel
+    10. ADD CLIP SLOT UI  -- Add-ClipSlotUI builds the dynamic per-slot card
+    11. TEMPLATE MGMT     -- Load/Save-Templates JSON
+    12. QUARTERSYNC       -- date-stripping, folder compare, sync engine, Excel export
+    13. QUARTER FILE MGMT -- quarter JSON file helpers
+    14. FILE INDEX        -- metadata-only folder scan, cache, filter
+    15. XAML              -- entire window XAML (inside Start-MacroHub here-string)
+    16. G() BINDINGS      -- FindName() calls that populate $ClipWbCombo etc.
+    17. REFRESH FUNCTIONS -- Refresh-* functions that populate UI controls from data
+    18. EVENT HANDLERS    -- Add_Click / Add_SelectionChanged for every control
+    19. KEYBOARD / KEYTIPS -- Alt overlay, Ctrl+PgUp/PgDn, Ctrl+F search
+    20. INITIAL LOAD      -- startup data population and lazy-tab loading
+    21. SHOW WINDOW       -- $Window.ShowDialog()
+    22. LAUNCH            -- Start-MacroHub (entry point at file end)
 #>
 
 # ============================================================
 #  ASSEMBLIES
 # ============================================================
+# Load WPF (PresentationFramework/Core/WindowsBase) and Windows.Forms for
+# dialogs, plus System.Drawing for the system-tray NotifyIcon.
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
@@ -24,6 +79,8 @@ Add-Type -AssemblyName System.Drawing
 # ============================================================
 #  CONFIGURATION
 # ============================================================
+# All file paths are derived from $HubRoot (the folder that contains this script).
+# JSON is the canonical storage format; CSV paths are kept only for legacy migration.
 $script:HubRoot      = Split-Path $MyInvocation.MyCommand.Path
 $script:MacroFolder  = Join-Path $script:HubRoot 'Macros'
 $script:LogFile      = Join-Path $script:HubRoot 'MacroHub.log'
@@ -46,6 +103,9 @@ $script:AppVersion   = '3.2.0'
 # ============================================================
 #  GLOBAL STATE
 # ============================================================
+# Runtime-mutable variables shared across functions.
+# ClipSlots is a hashtable keyed by "Slot_N" holding per-slot state objects.
+# ExcelMainApp / ExcelNavApp cache live COM handles; they are validated before use.
 $script:ClipSlots      = @{}
 $script:ClipSlotIdx    = 0
 $script:ClipSequenceEnabled = $false
@@ -82,6 +142,7 @@ function HexBrush([string]$hex) {
 # ============================================================
 #  ACTIVITY LOGGER (CSV-safe, ASCII only)
 # ============================================================
+# Appends a timestamped CSV row to MacroHub.log for every user action.
 function Write-ActivityLog {
     param([string]$Action)
     $safe = $Action -replace '"','""'
@@ -89,7 +150,7 @@ function Write-ActivityLog {
     try { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 } catch {}
 }
 
-# Normalize loaded JSON/CSV payloads to a null-free object array.
+# Strips $null entries from a loaded JSON/CSV array and guarantees an array return.
 function Normalize-List {
     param($InputObject)
     $items = @($InputObject | Where-Object { $null -ne $_ })
@@ -99,6 +160,8 @@ function Normalize-List {
 # ============================================================
 #  UI HELPERS: busy overlay, status bar, dispatcher flush
 # ============================================================
+# Processes all pending WPF dispatcher messages, keeping the UI responsive
+# during long-running synchronous operations.
 function Update-UI {
     if ($script:Window) {
         $script:Window.Dispatcher.Invoke(
@@ -106,6 +169,8 @@ function Update-UI {
     }
 }
 
+# Shows the modal busy overlay with $Message and increments a nesting counter so
+# nested Show-Busy/Hide-Busy pairs don't prematurely hide the overlay.
 function Show-Busy {
     param([string]$Message = 'Working...')
     $script:BusyCount++
@@ -116,6 +181,7 @@ function Show-Busy {
     Update-UI
 }
 
+# Decrements the busy counter and hides the overlay when it reaches zero.
 function Hide-Busy {
     $script:BusyCount = [Math]::Max(0, $script:BusyCount - 1)
     if ($script:BusyCount -eq 0 -and $script:BusyOverlay) {
@@ -124,6 +190,7 @@ function Hide-Busy {
     Update-UI
 }
 
+# Updates the status bar text and foreground color; defaults to muted grey.
 function Set-Status {
     param([string]$Text, [string]$Color = '#B0B0B0')
     if ($script:StatusBar) {
@@ -136,6 +203,12 @@ function Set-Status {
 # ============================================================
 #  EXCEL COM HELPERS
 # ============================================================
+# These functions centralise all COM interop with Excel.
+# Two COM sessions are tracked: 'Main' (used by Clipboard/Macros tabs) and
+# 'Navigator' (a dedicated or fallback instance for the Navigator tab).
+# Validates the cached handle with Test-ExcelComObject before each use.
+
+# Returns $true if $ExcelApp is a live COM object with an accessible Workbooks collection.
 function Test-ExcelComObject {
     param($ExcelApp)
     if (-not $ExcelApp) { return $false }
@@ -147,6 +220,8 @@ function Test-ExcelComObject {
     }
 }
 
+# Returns the cached or running Excel COM object for the given session ('Main',
+# 'Navigator', or 'Any'); creates a new visible instance when -Create is specified.
 function Get-ExcelApp {
     param(
         [ValidateSet('Main','Navigator','Any')]
@@ -178,6 +253,8 @@ function Get-ExcelApp {
     }
 
     try {
+        # GetActiveObject retrieves the running Excel COM instance registered in the ROT
+        # (Running Object Table); throws if no instance is currently running.
         $active = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')
     } catch {
         $active = $null
@@ -200,6 +277,7 @@ function Get-ExcelApp {
     return $null
 }
 
+# Returns an array of open workbook names from the specified Excel session.
 function Get-OpenWorkbooks {
     param(
         [ValidateSet('Main','Navigator','Any')]
@@ -210,12 +288,14 @@ function Get-OpenWorkbooks {
     $names = @()
     try {
         for ($i = 1; $i -le $xl.Workbooks.Count; $i++) {
+            # Workbooks collection is 1-based in Excel COM
             $names += $xl.Workbooks.Item($i).Name
         }
     } catch {}
     return $names
 }
 
+# Returns an array of worksheet names for the named open workbook.
 function Get-WorksheetNames {
     param(
         [string]$WorkbookName,
@@ -243,6 +323,7 @@ function Get-WorkbookSheets {
     return Get-WorksheetNames -WorkbookName $WorkbookName -Session $Session
 }
 
+# Opens $FilePath in the specified Excel session, creating that session if needed.
 function Open-WorkbookInExcel {
     param(
         [string]$FilePath,
@@ -258,6 +339,8 @@ function Open-WorkbookInExcel {
     }
 }
 
+# Writes $Text line by line into the worksheet starting at $CellAddress; used by
+# the Templates tab paste action (plain text only, no formatting).
 function Paste-TextToSheet {
     param(
         [string]$WorkbookName,
@@ -286,6 +369,8 @@ function Paste-TextToSheet {
 #  MACRO DISCOVERY
 # ============================================================
 # Returns all .ps1 and .bas files found under $script:MacroFolder (recursive).
+# Scans the Macros/ subfolder recursively for .bas (VBA) and .ps1 (PowerShell)
+# files that can be run by the Macros tab or scheduled by the Scheduler tab.
 function Get-MacroFiles {
     if (-not (Test-Path $script:MacroFolder)) { return @() }
     $files = Get-ChildItem -Path $script:MacroFolder -Recurse -File -ErrorAction SilentlyContinue |
@@ -329,10 +414,11 @@ function Invoke-VbaMacro {
     elseif ($content -match 'Sub\s+(\w+)\s*\(') { $entryPoint = $matches[1] }
     if (-not $entryPoint) { throw 'No Sub found in .bas file.' }
 
-    # Import module, run, then remove
+    # Import module, run, then remove so the workbook is not left dirty with the macro.
     $vbProj = $wb.VBProject
     $comp = $vbProj.VBComponents.Import($MacroFile)
     try {
+        # Run format: "WorkbookName!ModuleName.SubName"
         $xl.Run("$($wb.Name)!$($comp.Name).$entryPoint")
     } finally {
         try { $vbProj.VBComponents.Remove($comp) } catch {}
@@ -340,6 +426,8 @@ function Invoke-VbaMacro {
     Write-ActivityLog "Ran VBA macro: $entryPoint from $(Split-Path $MacroFile -Leaf)"
 }
 
+# Executes a .ps1 script, forwarding -WorkbookName / -SheetName parameters when
+# the script accepts them; silently retries without -SheetName on parameter error.
 function Invoke-PsScript {
     param(
         [string]$ScriptFile,
@@ -369,6 +457,7 @@ function Invoke-PsScript {
     Write-ActivityLog "Ran PS script: $(Split-Path $ScriptFile -Leaf)"
 }
 
+# Dispatches $MacroFile to either Invoke-VbaMacro (.bas) or Invoke-PsScript (.ps1).
 function Invoke-SelectedMacro {
     param(
         [string]$MacroFile,
@@ -388,6 +477,8 @@ function Invoke-SelectedMacro {
 #  TASK SCHEDULER (Windows Task Scheduler COM)
 # ============================================================
 # All scheduled tasks are stored under the '\MacroHub' folder in Windows Task Scheduler.
+# Schedule.Service is the COM interface for the Task Scheduler engine; tasks are
+# defined via ITaskDefinition objects with time triggers and powershell.exe actions.
 #
 # Get-HubTasks:          Returns a list of task objects (name, state, next/last run times).
 # Get-MissedTasks:       Returns tasks that should have run but didn't (PC was off).
@@ -506,6 +597,9 @@ function Invoke-MissedTaskCheck {
     }
 }
 
+# Creates a Windows Task Scheduler entry under \MacroHub that runs $MacroFile
+# at $TriggerTime (HH:mm) on the given $Frequency (Daily / Weekly / Monthly).
+# For .bas files, generates a PowerShell wrapper script in sched_wrappers/ first.
 function Register-HubTask {
     param(
         [string]$TaskName,
@@ -554,10 +648,10 @@ finally { try { `$wb.VBProject.VBComponents.Remove(`$comp) } catch {} }
     }
     $folder = $svc.GetFolder('\MacroHub')
 
-    $def = $svc.NewTask(0)
+    $def = $svc.NewTask(0)   # 0 = TASK_VALIDATE_ONLY flag; required by the API
     $def.RegistrationInfo.Description = "MacroHub scheduled: $TaskName -- File: $MacroFile"
     $def.Settings.Enabled = $true
-    $def.Settings.StartWhenAvailable = $true
+    $def.Settings.StartWhenAvailable = $true   # run missed trigger when PC wakes
     $def.Settings.RunOnlyIfNetworkAvailable = $false
     $def.Settings.StopIfGoingOnBatteries   = $false
     $def.Settings.DisallowStartIfOnBatteries = $false
@@ -572,25 +666,27 @@ finally { try { `$wb.VBProject.VBComponents.Remove(`$comp) } catch {} }
         # Monthly trigger (type 4)
         $trigger = $def.Triggers.Create(4)
         $trigger.StartBoundary = $start.ToString('yyyy-MM-ddTHH:mm:ss')
-        $trigger.DaysOfMonth   = [Math]::Pow(2, $start.Day - 1)  # bitmask
-        $trigger.MonthsOfYear  = 4095  # all 12 months
+        $trigger.DaysOfMonth   = [Math]::Pow(2, $start.Day - 1)  # bitmask: bit N = day N+1
+        $trigger.MonthsOfYear  = 4095  # all 12 months (bitmask: bits 0-11)
     } else {
-        # Daily trigger (type 2)
+        # Daily trigger (type 2); DaysInterval=7 simulates weekly frequency
         $trigger = $def.Triggers.Create(2)
         $trigger.StartBoundary = $start.ToString('yyyy-MM-ddTHH:mm:ss')
         if ($Frequency -eq 'Weekly') { $trigger.DaysInterval = 7 }
         else { $trigger.DaysInterval = 1 }
     }
 
-    $action = $def.Actions.Create(0)
+    $action = $def.Actions.Create(0)   # 0 = TASK_ACTION_EXEC
     $action.Path = 'powershell.exe'
     $action.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runFile`""
     $action.WorkingDirectory = $script:HubRoot
 
+    # RegisterTaskDefinition flags: 6 = CREATE_OR_UPDATE, 3 = TASK_LOGON_INTERACTIVE_TOKEN
     $folder.RegisterTaskDefinition($TaskName, $def, 6, $null, $null, 3)
     Write-ActivityLog "Scheduled task: $TaskName ($Frequency at $TriggerTime) -> $runFile"
 }
 
+# Deletes the named task from the \MacroHub Task Scheduler folder.
 function Remove-HubTask {
     param([string]$TaskName)
     try {
@@ -605,11 +701,13 @@ function Remove-HubTask {
 }
 
 # ============================================================
-#  CLIPBOARD SLOT HELPERS
-# ============================================================
-# ============================================================
 #  FAVORITES PERSISTENCE
 # ============================================================
+# Favorites are macro names that appear at the top of the Macros list with a [*]
+# prefix.  They are persisted in favorites.json as a sorted unique string array.
+
+# Loads the favorites list from JSON (or migrates from legacy CSV); returns an
+# array of PSCustomObjects with a Name property.
 function Load-Favorites {
     if (Test-Path $script:FavJson) {
         try {
@@ -668,6 +766,8 @@ function Get-FavoriteNames {
 # ============================================================
 #  GLOBAL SEARCH
 # ============================================================
+# Searches macros, templates, QTasks todos, and scheduled tasks for $query and
+# returns a list of result objects with Tab, Item, and Detail properties.
 function Search-AllTabs([string]$query) {
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
     $q = $query.ToLower()
@@ -707,6 +807,10 @@ function Search-AllTabs([string]$query) {
 # ============================================================
 #  CLIPBOARD DEFAULT SETTINGS
 # ============================================================
+# Saves/loads the last-used workbook, sheet, cell, and timestamp settings so
+# they are restored on the next MacroHub launch.
+
+# Loads saved clipboard defaults from clip_defaults.json; returns $null if none saved.
 function Load-ClipDefaults {
     if (Test-Path $script:ClipDefaultsJson) {
         try { return (Get-Content $script:ClipDefaultsJson -Raw | ConvertFrom-Json) } catch {}
@@ -716,15 +820,15 @@ function Load-ClipDefaults {
 
 function Save-ClipDefaults {
     param([string]$Workbook, [string]$Sheet, [string]$Cell,
-          [bool]$Timestamp, [string]$DateOffset, [string]$TimeOffset)
+          [bool]$Timestamp, [string]$DateCell, [string]$TimeCell)
     $obj = @{
-        Workbook   = $Workbook
-        Sheet      = $Sheet
-        Cell       = $Cell
-        Timestamp  = $Timestamp
-        DateOffset = $DateOffset
-        TimeOffset = $TimeOffset
-        SavedOn    = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Workbook  = $Workbook
+        Sheet     = $Sheet
+        Cell      = $Cell
+        Timestamp = $Timestamp
+        DateCell  = $DateCell
+        TimeCell  = $TimeCell
+        SavedOn   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
     $obj | ConvertTo-Json | Set-Content $script:ClipDefaultsJson -Encoding UTF8
 }
@@ -742,10 +846,14 @@ function Save-ClipDefaults {
 #   Path 2 — Native clipboard paste: restores DataObject → PasteSpecial(xlPasteAll).
 #   Path 3 — Plain-text Value2 fallback + PasteSpecial(xlPasteFormats) overlay from source.
 #   Post-paste house-style rules are only applied when no Excel formatting was preserved.
-#
 # ============================================================
-#  DYNAMIC CLIPBOARD SLOT UI BUILDER
-# ============================================================
+# These functions handle clipboard reading, dimension detection, matrix
+# conversion, and the multi-strategy paste pipeline to Excel.
+
+# Reads the current clipboard and returns a packet object containing the raw
+# IDataObject, extracted text, format list, SHA-1 signature (for change detection),
+# and Excel source metadata (workbook/sheet/address) when a copy range is active.
+# Retries up to 5 times with short sleeps to handle transient clipboard lock errors.
 $script:ClipSlotIdx = 0
 
 function Get-ClipboardPacket {
@@ -774,6 +882,7 @@ function Get-ClipboardPacket {
                 foreach ($xlApp in $xlCandidates) {
                     $cutCopy = 0
                     try { $cutCopy = [int]$xlApp.CutCopyMode } catch { $cutCopy = 0 }
+                    # CutCopyMode: 1 = xlCopy (marching ants active), 2 = xlCut; skip if no copy in progress
                     if ($cutCopy -ne 1) { continue }
 
                     $sel = $null
@@ -821,6 +930,8 @@ function Get-ClipboardPacket {
     return $null
 }
 
+# Parses tab-delimited clipboard text and returns an object with Rows and Cols
+# counts (trailing blank rows are trimmed).
 function Get-ClipboardDimensions {
     param([string]$Text)
     if (-not $Text) { return [PSCustomObject]@{ Rows = 1; Cols = 1 } }
@@ -837,6 +948,9 @@ function Get-ClipboardDimensions {
     return [PSCustomObject]@{ Rows = $rows.Count; Cols = $maxCols }
 }
 
+# Converts tab-delimited clipboard text into a 2-D object array suitable for
+# bulk assignment to Excel's Range.Value2.
+# Returns a 2-D array dimensioned [1..Rows, 1..Cols] (1-based lower bounds).
 function Convert-ClipboardTextToMatrix {
     param(
         [string]$Text,
@@ -999,6 +1113,11 @@ function Apply-PostPasteCellRules {
     }
 }
 
+# Pastes a captured clipboard packet into the target Excel cell using a
+# three-tier strategy: (1) direct source range Copy if Excel source metadata is
+# available; (2) native PasteSpecial/Paste via the live clipboard; (3) bulk
+# Value2 array assignment for plain-text fallback.
+# When $AddTimestamp is true, writes date/time into rows above the paste target.
 function Paste-ClipboardPacketToExcel {
     param(
         [object]$Packet,
@@ -1006,31 +1125,72 @@ function Paste-ClipboardPacketToExcel {
         [string]$SheetName,
         [string]$CellAddress,
         [bool]$AddTimestamp,
-        [string]$DateOffset,
-        [string]$TimeOffset
+        [string]$DateCell,
+        [string]$TimeCell
     )
-    if (-not $Packet) { throw 'Clipboard slot is empty.' }
-    $xl = Get-ExcelApp -Session Main
-    if (-not $xl) { throw 'Excel is not open.' }
-    $wbObj = $xl.Workbooks.Item($WorkbookName)
-    $ws    = $wbObj.Worksheets.Item($SheetName)
-    $target = $ws.Range($CellAddress)
-    $r = [int]$target.Row
-    $c = [int]$target.Column
+    if (-not $Packet) { throw 'Clipboard slot is empty — nothing to paste.' }
+
+    # Guard: packet has usable content
+    $hasText   = $Packet.Text -and $Packet.Text.Trim().Length -gt 0
+    $hasData   = $null -ne $Packet.DataObject
+    $hasSrc    = $null -ne $Packet.ExcelSource
+    if (-not $hasText -and -not $hasData -and -not $hasSrc) {
+        throw 'Clipboard packet contains no text, data, or Excel range — nothing to paste.'
+    }
+
+    # Guard: Excel session
+    $xl = $null
+    try { $xl = Get-ExcelApp -Session Main } catch {}
+    if (-not $xl) { throw 'Excel is not open or not responding.' }
+
+    # Guard: workbook
+    $wbObj = $null
+    try { $wbObj = $xl.Workbooks.Item($WorkbookName) } catch {}
+    if (-not $wbObj) { throw "Workbook '$WorkbookName' is not open." }
+
+    # Guard: read-only
+    $isReadOnly = $false
+    try { $isReadOnly = [bool]$wbObj.ReadOnly } catch {}
+    if ($isReadOnly) { throw "Workbook '$WorkbookName' is read-only — cannot paste." }
+
+    # Guard: worksheet
+    $ws = $null
+    try { $ws = $wbObj.Worksheets.Item($SheetName) } catch {}
+    if (-not $ws) { throw "Sheet '$SheetName' not found in '$WorkbookName'." }
+
+    # Guard: target cell
+    $target = $null
+    try { $target = $ws.Range($CellAddress) } catch {}
+    if (-not $target) { throw "Cell address '$CellAddress' is not valid." }
+
+    $r = 1; $c = 1
+    try { $r = [int]$target.Row    } catch {}
+    try { $c = [int]$target.Column } catch {}
     $dims = Get-ClipboardDimensions -Text $Packet.Text
     $rows = [Math]::Max(1, [int]$dims.Rows)
     $cols = [Math]::Max(1, [int]$dims.Cols)
     $textRows = $rows
     $textCols = $cols
 
-    $dest = $ws.Range(
-        $ws.Cells.Item($r, $c),
-        $ws.Cells.Item($r + $rows - 1, $c + $cols - 1)
-    )
+    $dest = $null
+    try {
+        $dest = $ws.Range(
+            $ws.Cells.Item($r, $c),
+            $ws.Cells.Item($r + $rows - 1, $c + $cols - 1)
+        )
+    } catch { throw "Could not build destination range at ${CellAddress}: $($_.Exception.Message)" }
+    if (-not $dest) { throw "Destination range is null for address '$CellAddress'." }
+
+    # Warn (but continue) if target contains merged cells — paste may partially succeed.
+    $hasMerge = $false
+    try { $hasMerge = [bool]$dest.MergeCells } catch {}
+    if ($hasMerge) {
+        Set-Status "Warning: target range has merged cells — paste results may vary." '#E0A050'
+    }
 
     # Required order: clear values, clear formats, then paste.
-    $dest.ClearContents()
-    $dest.ClearFormats()
+    try { $dest.ClearContents() } catch {}
+    try { $dest.ClearFormats()  } catch {}
 
     # Track whether native Excel formatting was preserved (suppresses post-paste style rules).
     $usedClipboardPaste = $false
@@ -1145,6 +1305,8 @@ function Paste-ClipboardPacketToExcel {
 
     # ── PATH 3: Plain-text fallback — values only via 2D array assignment ──
     if (-not $usedClipboardPaste) {
+        # Fallback for plain text payloads: bulk-assign the entire matrix in one COM call,
+        # which is far faster than writing cells one at a time for large ranges.
         $matrix = Convert-ClipboardTextToMatrix -Text $Packet.Text -Rows $rows -Cols $cols
         $dest.Value2 = $matrix
 
@@ -1193,23 +1355,46 @@ function Paste-ClipboardPacketToExcel {
     }
 
     if ($AddTimestamp) {
-        $dOff = 1; $tOff = 2
-        try { $dOff = [int]$DateOffset } catch {}
-        try { $tOff = [int]$TimeOffset } catch {}
-        $dateRow = $r - $dOff
-        $timeRow = $r - $tOff
-        if ($dateRow -ge 1) {
-            $ws.Cells.Item($dateRow, $c).Value2 = (Get-Date -Format 'MM/dd/yyyy')
+        $effDateCell = if ([string]::IsNullOrWhiteSpace($DateCell)) { 'A3' } else { $DateCell.Trim() }
+        $effTimeCell = if ([string]::IsNullOrWhiteSpace($TimeCell)) { 'A2' } else { $TimeCell.Trim() }
+        if ($effDateCell) {
+            try {
+                $dtRange = $null
+                try { $dtRange = $ws.Range($effDateCell) } catch {}
+                if ($dtRange) {
+                    $dtRange.Value2 = (Get-Date -Format 'MM/dd/yyyy')
+                } else {
+                    Set-Status "Timestamp: date cell '$effDateCell' is not a valid address — skipped." '#E0A050'
+                }
+            } catch {
+                Set-Status "Timestamp (date) write failed for '$effDateCell': $($_.Exception.Message)" '#E0A050'
+            }
         }
-        if ($timeRow -ge 1) {
-            $ws.Cells.Item($timeRow, $c).Value2 = (Get-Date -Format 'hh:mm tt')
+        if ($effTimeCell) {
+            try {
+                $tmRange = $null
+                try { $tmRange = $ws.Range($effTimeCell) } catch {}
+                if ($tmRange) {
+                    $tmRange.Value2 = (Get-Date -Format 'hh:mm tt')
+                } else {
+                    Set-Status "Timestamp: time cell '$effTimeCell' is not a valid address — skipped." '#E0A050'
+                }
+            } catch {
+                Set-Status "Timestamp (time) write failed for '$effTimeCell': $($_.Exception.Message)" '#E0A050'
+            }
         }
     }
 }
 
+# ============================================================
+#  DYNAMIC CLIPBOARD SLOT UI BUILDER
+# ============================================================
 # Add-ClipSlotUI: Programmatically builds one clipboard slot card and appends it to
 # ClipSlotsPanel. Each card contains a text preview box, per-slot sheet/cell/timestamp
 # controls, and Record/Paste/Remove buttons. State is tracked in $script:ClipSlots[$tag].
+# Each slot is an independent recording unit with its own DispatcherTimer,
+# sheet/cell/timestamp controls, and paste button.
+# The slot's state object is stored in $script:ClipSlots keyed by "Slot_N".
 function Add-ClipSlotUI {
     param(
         $Panel,
@@ -1217,8 +1402,8 @@ function Add-ClipSlotUI {
         [string]$DefaultSheet,
         [string]$DefaultCell,
         [bool]$DefaultTimestamp,
-        [string]$DefaultDateOffset,
-        [string]$DefaultTimeOffset,
+        [string]$DefaultDateCell,
+        [string]$DefaultTimeCell,
         $CountLabel
     )
     $script:ClipSlotIdx++
@@ -1233,10 +1418,11 @@ function Add-ClipSlotUI {
         SheetCombo     = $null
         CellBox        = $null
         TimestampChk   = $null
-        DateOffsetBox  = $null
-        TimeOffsetBox  = $null
+        DateCellBox    = $null
+        TimeCellBox    = $null
     }
-    # Capture direct hashtable reference for WPF event closures.
+    # Capture a direct reference to the hashtable so WPF event closures (which run
+    # in a child scope) can still read/write the live slot state after Add_Click fires.
     $clipSlotsRef = $script:ClipSlots
 
     # Card border
@@ -1367,50 +1553,38 @@ function Add-ClipSlotUI {
     [void]($btnRow.Children.Add($slotTsChk))
 
     $slotDateLbl = [System.Windows.Controls.TextBlock]::new()
-    $slotDateLbl.Text = 'Date'
+    $slotDateLbl.Text = 'Date→'
     $slotDateLbl.Foreground = (HexBrush '#FFFFFF')
     $slotDateLbl.FontSize = 11
     $slotDateLbl.VerticalAlignment = 'Center'
     $slotDateLbl.Margin = [System.Windows.Thickness]::new(0,0,4,0)
+    $slotDateLbl.ToolTip = 'Cell address where the date timestamp will be written (e.g. A3)'
     [void]($btnRow.Children.Add($slotDateLbl))
 
-    $slotDateOffsetBox = [System.Windows.Controls.TextBox]::new()
-    $slotDateOffsetBox.Width = 44
-    $slotDateOffsetBox.TextAlignment = 'Center'
-    $slotDateOffsetBox.Text = if ([string]::IsNullOrWhiteSpace($DefaultDateOffset)) { '1' } else { [string]$DefaultDateOffset }
-    $slotDateOffsetBox.Margin = [System.Windows.Thickness]::new(0,0,4,0)
-    [void]($btnRow.Children.Add($slotDateOffsetBox))
-
-    $slotDateUpLbl = [System.Windows.Controls.TextBlock]::new()
-    $slotDateUpLbl.Text = 'up'
-    $slotDateUpLbl.Foreground = (HexBrush '#FFFFFF')
-    $slotDateUpLbl.FontSize = 11
-    $slotDateUpLbl.VerticalAlignment = 'Center'
-    $slotDateUpLbl.Margin = [System.Windows.Thickness]::new(0,0,8,0)
-    [void]($btnRow.Children.Add($slotDateUpLbl))
+    $slotDateCellBox = [System.Windows.Controls.TextBox]::new()
+    $slotDateCellBox.Width = 60
+    $slotDateCellBox.TextAlignment = 'Center'
+    $slotDateCellBox.Text = if ([string]::IsNullOrWhiteSpace($DefaultDateCell)) { 'A3' } else { [string]$DefaultDateCell }
+    $slotDateCellBox.Margin = [System.Windows.Thickness]::new(0,0,8,0)
+    $slotDateCellBox.ToolTip = 'Cell address where the date timestamp will be written (e.g. A3)'
+    [void]($btnRow.Children.Add($slotDateCellBox))
 
     $slotTimeLbl = [System.Windows.Controls.TextBlock]::new()
-    $slotTimeLbl.Text = 'Time'
+    $slotTimeLbl.Text = 'Time→'
     $slotTimeLbl.Foreground = (HexBrush '#FFFFFF')
     $slotTimeLbl.FontSize = 11
     $slotTimeLbl.VerticalAlignment = 'Center'
     $slotTimeLbl.Margin = [System.Windows.Thickness]::new(0,0,4,0)
+    $slotTimeLbl.ToolTip = 'Cell address where the time timestamp will be written (e.g. A2)'
     [void]($btnRow.Children.Add($slotTimeLbl))
 
-    $slotTimeOffsetBox = [System.Windows.Controls.TextBox]::new()
-    $slotTimeOffsetBox.Width = 44
-    $slotTimeOffsetBox.TextAlignment = 'Center'
-    $slotTimeOffsetBox.Text = if ([string]::IsNullOrWhiteSpace($DefaultTimeOffset)) { '2' } else { [string]$DefaultTimeOffset }
-    $slotTimeOffsetBox.Margin = [System.Windows.Thickness]::new(0,0,4,0)
-    [void]($btnRow.Children.Add($slotTimeOffsetBox))
-
-    $slotTimeUpLbl = [System.Windows.Controls.TextBlock]::new()
-    $slotTimeUpLbl.Text = 'up'
-    $slotTimeUpLbl.Foreground = (HexBrush '#FFFFFF')
-    $slotTimeUpLbl.FontSize = 11
-    $slotTimeUpLbl.VerticalAlignment = 'Center'
-    $slotTimeUpLbl.Margin = [System.Windows.Thickness]::new(0,0,10,0)
-    [void]($btnRow.Children.Add($slotTimeUpLbl))
+    $slotTimeCellBox = [System.Windows.Controls.TextBox]::new()
+    $slotTimeCellBox.Width = 60
+    $slotTimeCellBox.TextAlignment = 'Center'
+    $slotTimeCellBox.Text = if ([string]::IsNullOrWhiteSpace($DefaultTimeCell)) { 'A2' } else { [string]$DefaultTimeCell }
+    $slotTimeCellBox.Margin = [System.Windows.Thickness]::new(0,0,10,0)
+    $slotTimeCellBox.ToolTip = 'Cell address where the time timestamp will be written (e.g. A2)'
+    [void]($btnRow.Children.Add($slotTimeCellBox))
 
     $pasteBtn = [System.Windows.Controls.Button]::new()
     $pasteBtn.Content = 'Paste to Excel'
@@ -1431,8 +1605,8 @@ function Add-ClipSlotUI {
         $slotRef.SheetCombo    = $slotSheetCombo
         $slotRef.CellBox       = $slotCellBox
         $slotRef.TimestampChk  = $slotTsChk
-        $slotRef.DateOffsetBox = $slotDateOffsetBox
-        $slotRef.TimeOffsetBox = $slotTimeOffsetBox
+        $slotRef.DateCellBox   = $slotDateCellBox
+        $slotRef.TimeCellBox   = $slotTimeCellBox
     }
 
     # Seed slot sheet options from selected workbook.
@@ -1453,8 +1627,10 @@ function Add-ClipSlotUI {
     # Update count label
     $CountLabel.Text = "$($Panel.Children.Count)"
 
+    # DispatcherTimer fires on the UI thread, so clipboard reads and textbox
+    # updates are safe without explicit Dispatcher.Invoke marshalling.
     $recTimer = [System.Windows.Threading.DispatcherTimer]::new()
-    $recTimer.Interval = [TimeSpan]::FromMilliseconds(350)
+    $recTimer.Interval = [TimeSpan]::FromMilliseconds(350)   # poll clipboard ~3×/second
 
     $setRecUi = {
         param([bool]$on)
@@ -1471,6 +1647,8 @@ function Add-ClipSlotUI {
             $recTxt.Text = 'REC OFF'
             $recTxt.Foreground = (HexBrush '#6E6E6E')
         }
+    # GetNewClosure() captures the current values of $copyBtn, $recTxt etc. so the
+    # script block references this slot's controls even after later slots are added.
     }.GetNewClosure()
 
     $recTimer.Add_Tick({
@@ -1602,14 +1780,14 @@ function Add-ClipSlotUI {
             $packet = [PSCustomObject]@{ DataObject = $null; Text = $tb.Text; CapturedOn = (Get-Date -f 'yyyy-MM-dd HH:mm:ss') }
         }
 
-        $dateOffset = if ($slot.DateOffsetBox) { [string]$slot.DateOffsetBox.Text } else { '1' }
-        $timeOffset = if ($slot.TimeOffsetBox) { [string]$slot.TimeOffsetBox.Text } else { '2' }
+        $dateCellVal = if ($slot.DateCellBox) { [string]$slot.DateCellBox.Text } else { 'A3' }
+        $timeCellVal = if ($slot.TimeCellBox) { [string]$slot.TimeCellBox.Text } else { 'A2' }
         $addTs = if ($slot.TimestampChk) { [bool]$slot.TimestampChk.IsChecked } else { $false }
 
         Show-Busy 'Pasting to Excel...'
         try {
             Paste-ClipboardPacketToExcel -Packet $packet -WorkbookName ([string]$wb) -SheetName ([string]$sh) `
-                -CellAddress $cell -AddTimestamp $addTs -DateOffset $dateOffset -TimeOffset $timeOffset
+                -CellAddress $cell -AddTimestamp $addTs -DateCell $dateCellVal -TimeCell $timeCellVal
             $slot.Packet = $packet
             $slot.Text = $tb.Text
             Set-Status "Pasted slot $num to $wb > $sh > $cell"
@@ -1637,6 +1815,7 @@ function Add-ClipSlotUI {
 # ============================================================
 #  MACRO NAME HELPERS (favorites prefix)
 # ============================================================
+# Strips the "[*] " or "    " prefix that Refresh-MacroList adds to list items.
 function Get-CleanMacroName([string]$DisplayName) {
     if ($DisplayName -match '^\[.\]\s+(.+)$') { return $Matches[1] }
     return $DisplayName
@@ -1645,6 +1824,10 @@ function Get-CleanMacroName([string]$DisplayName) {
 # ============================================================
 #  TEMPLATE MANAGEMENT
 # ============================================================
+# Text templates are persisted in templates.json as objects with Name and
+# Content properties.  Content uses literal "\n" for newlines to stay JSON-safe.
+
+# Loads all templates from JSON (migrating from CSV if needed); returns array.
 function Load-Templates {
     if (Test-Path $script:TemplateJson) {
         try { return ,(Normalize-List (Get-Content $script:TemplateJson -Raw | ConvertFrom-Json)) } catch { return ,@() }
@@ -1659,6 +1842,7 @@ function Load-Templates {
     return ,@()
 }
 
+# Serializes the $Templates array to templates.json (writes "[]" when empty).
 function Save-Templates {
     param([array]$Templates)
     if ($Templates.Count -eq 0) {
@@ -1671,6 +1855,8 @@ function Save-Templates {
 # ============================================================
 #  QUARTERSYNC - DATE STRIPPING REGEX
 # ============================================================
+# Regex patterns used to normalise file names before comparison so that
+# "Report_Q1_2024.xlsx" and "Report_Q2_2025.xlsx" are treated as the same file.
 $script:DatePatterns = @(
     'Q[1-4][-_\s]?20\d{2}', '20\d{2}[-_\s]?Q[1-4]',
     '20\d{2}[-_\s]\d{2}[-_\s]\d{2}', '\d{2}[-_\s]\d{2}[-_\s]20\d{2}',
@@ -1680,6 +1866,8 @@ $script:DatePatterns = @(
     'FY20\d{2}', 'YE20\d{2}', '20\d{2}'
 )
 
+# Removes all date/quarter/year tokens from a filename and returns the normalised
+# lowercase base name used as the comparison key.
 function Strip-DateTokens([string]$name) {
     $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
     foreach ($pat in $script:DatePatterns) {
@@ -1692,6 +1880,11 @@ function Strip-DateTokens([string]$name) {
 # ============================================================
 #  QUARTERSYNC - JSON HELPERS
 # ============================================================
+# These functions handle persistence for QTasks (todo lists per quarter/compare
+# run), the sync log, and the QSync configuration file.
+# All data is stored as JSON; CSV paths are only used for one-time legacy migration.
+
+# Resolves a path to its canonical .json form, accepting .csv or bare name input.
 function Resolve-QsTodoPath {
     param([string]$PathLike)
     if (-not $PathLike) { return $null }
@@ -1701,6 +1894,8 @@ function Resolve-QsTodoPath {
     return "$PathLike.json"
 }
 
+# Loads the todo item array from the JSON file at $Path (defaults to
+# $ActiveQuarterPath); migrates from CSV if the JSON does not yet exist.
 function Load-QsTodos {
     param([string]$Path)
     if (-not $Path) { $Path = $script:ActiveQuarterPath }
@@ -1726,6 +1921,7 @@ function Load-QsTodos {
     return ,@()
 }
 
+# Serializes $todos to JSON at $Path (defaults to $ActiveQuarterPath).
 function Save-QsTodos([array]$todos, [string]$Path) {
     if (-not $Path) { $Path = $script:ActiveQuarterPath }
     if (-not $Path) { return }
@@ -1801,7 +1997,8 @@ function Save-QsConfig($cfg) {
     } | ConvertTo-Json | Set-Content $script:QsCfgJson -Encoding UTF8
 }
 
-# Compare-mode persistence (QTasks folder A vs folder B)
+# Loads the compare-mode missing-file list from qs_compare_results.json; this is
+# the dataset displayed in the QTasks tab after a folder comparison.
 function Load-QsCompareTodos {
     if (-not (Test-Path $script:QsCompareJson)) { return ,@() }
     try {
@@ -1811,6 +2008,7 @@ function Load-QsCompareTodos {
     }
 }
 
+# Persists the compare-mode missing-file list to qs_compare_results.json.
 function Save-QsCompareTodos([array]$todos) {
     $clean = Normalize-List $todos
     if ($clean.Count -eq 0) {
@@ -1842,6 +2040,9 @@ function Get-QsCompareFileKey($Root, $FileInfo) {
     }
 }
 
+# Compares two folder trees by normalised (date-stripped) file key, returning a
+# result object whose MissingTodos array lists files present in $SourceRoot but
+# absent from $TargetRoot; used to populate the QTasks deliverables list.
 function Compare-QsFolders {
     param([string]$SourceRoot, [string]$TargetRoot)
 
@@ -1893,6 +2094,13 @@ function Compare-QsFolders {
 # ============================================================
 #  QUARTERSYNC - CORE SYNC ENGINE
 # ============================================================
+# Invoke-QuarterSync mirrors the folder structure from the previous quarter into
+# the current quarter folder and creates todo items for files that exist in the
+# previous quarter but are missing from the new one.
+
+# Replicates missing subdirectories from $LastRoot into $ThisRoot, then generates
+# todo entries for files present in $LastRoot but not yet in $ThisRoot.
+# Results and new todos are merged into the active quarter JSON and the sync log.
 function Invoke-QuarterSync {
     param([string]$LastRoot, [string]$ThisRoot, [string]$QuarterPath)
 
@@ -1997,6 +2205,11 @@ function Invoke-QuarterSync {
 # ============================================================
 #  QUARTERSYNC - EXCEL EXPORT (COM, 3-sheet workbook)
 # ============================================================
+# Creates a formatted 3-sheet Excel workbook summarising the compare results:
+# Sheet 1 = missing deliverables list, Sheet 2 = folder sync log, Sheet 3 = stats.
+
+# Builds and saves a 3-sheet Excel report for the current compare results to
+# $SavePath; uses its own transient Excel COM instance (Visible=false).
 function Export-QsToExcel {
     param([string]$SavePath, [string]$SourcePath = '', [string]$TargetPath = '')
 
@@ -2127,6 +2340,10 @@ function Export-QsToExcel {
 # ============================================================
 #  QUARTER FILE MANAGEMENT
 # ============================================================
+# Helpers for managing the per-quarter JSON todo files stored in quarters/.
+
+# Returns an array of FileInfo objects for all quarter JSON files, newest first;
+# migrates any legacy CSV quarter files to JSON on first call.
 function Get-QuarterList {
     if (-not (Test-Path $script:QuartersDir)) { return ,@() }
     $d = @(Get-ChildItem $script:QuartersDir -Filter '*.json' | Sort-Object Name -Descending)
@@ -2145,6 +2362,8 @@ function Get-QuarterList {
     return ,$d
 }
 
+# Scans $FolderPath recursively and returns a todo array with one Pending entry
+# per file; used to seed a brand-new quarter file from an existing folder.
 function Scan-FolderToTodos {
     param([string]$FolderPath)
     if (-not (Test-Path $FolderPath)) { return @() }
@@ -2199,6 +2418,8 @@ function Get-ComboText($Combo) {
     return [string]$Combo.Text
 }
 
+# Returns a hex SHA-1 hash of $Text; used to fingerprint clipboard contents for
+# change detection without storing the full payload.
 function Get-TextSha1([string]$Text) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Text)
     $sha1 = [System.Security.Cryptography.SHA1]::Create()
@@ -2315,7 +2536,13 @@ function Start-FidxCooldownTimer {
 
 # ============================================================
 
+# Start-MacroHub is the single entry point for the entire application.
+# It defines the XAML here-string, parses it into a WPF Window, wires up all
+# G() element bindings, defines all refresh and event-handler functions, runs
+# startup data loading, and then calls $Window.ShowDialog() to block until close.
+# Does not return until the user closes the window.
 function Start-MacroHub {
+    param([string]$HideTabs = '')
 
 $xamlStr = @"
 <Window
@@ -2666,8 +2893,8 @@ $xamlStr = @"
                 <ComboBox x:Name="ClipSheetCombo"/>
                 <TextBox x:Name="ClipCellBox" Text="A1"/>
                 <CheckBox x:Name="ClipTimestampChk"/>
-                <TextBox x:Name="ClipDateOffset" Text="1"/>
-                <TextBox x:Name="ClipTimeOffset" Text="2"/>
+                <TextBox x:Name="ClipDateCell" Text="A3"/>
+                <TextBox x:Name="ClipTimeCell" Text="A2"/>
               </StackPanel>
             </Grid>
           </Border>
@@ -3706,6 +3933,325 @@ $xamlStr = @"
         </Grid>
       </TabItem>
 
+      <!-- ════════════════════════════════════════════════════════════ -->
+      <!-- FORMULA AUDITOR — read-only inspection + temp highlighting  -->
+      <!-- ════════════════════════════════════════════════════════════ -->
+      <TabItem Header="Formula Auditor">
+        <Grid Margin="24,18">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="10"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <!-- Top toolbar: cell address, formula, action buttons -->
+          <Border Grid.Row="0" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="100"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="Active Cell:" Foreground="#B0B0B0"
+                         FontSize="12" VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="2" x:Name="FaActiveCellTxt" Text="—"
+                         Foreground="#4C9FE6" FontSize="13" FontWeight="Bold"
+                         VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="4" Text="Formula / Value:" Foreground="#B0B0B0"
+                         FontSize="12" VerticalAlignment="Center"/>
+              <TextBlock Grid.Column="6" x:Name="FaFormulaTxt" Text="—"
+                         Foreground="#E0E0E0" FontSize="12" VerticalAlignment="Center"
+                         TextTrimming="CharacterEllipsis"/>
+              <Button Grid.Column="8"  x:Name="FaInspectBtn"  Content="_Inspect"
+                      Style="{StaticResource BtnAccent}" Padding="12,5"
+                      ToolTip="Inspect the currently selected cell in Excel"/>
+              <Button Grid.Column="10" x:Name="FaBackBtn"     Content="◀ Back"
+                      Style="{StaticResource Btn}" Padding="10,5" IsEnabled="False"
+                      ToolTip="Navigate back to the previous cell"/>
+              <Button Grid.Column="12" x:Name="FaAuditRangeBtn" Content="_Audit Range"
+                      Style="{StaticResource Btn}" Padding="10,5"
+                      ToolTip="Outline formula cells in the selected range with a temporary blue glow. Click Clear to remove highlights."/>
+              <Button Grid.Column="14" x:Name="FaClearHighlightsBtn" Content="✕ Clear Highlights"
+                      Style="{StaticResource BtnRed}" Padding="10,5" IsEnabled="False"
+                      ToolTip="Remove ALL temporary borders and background highlights Formula Auditor added to the spreadsheet"/>
+              <CheckBox Grid.Column="16" x:Name="FaAutoBox" Content="Auto"
+                        Foreground="#B0B0B0" FontSize="11" IsChecked="True"
+                        VerticalAlignment="Center"
+                        ToolTip="Automatically re-inspect when you move to a different cell (polls every 500 ms)"/>
+            </Grid>
+          </Border>
+
+          <!-- Main area: left = inspector + visualizer; right = dependency tree -->
+          <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="12"/>
+              <ColumnDefinition Width="270"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Left column: Cell Inspector + SUMIF Visualizer -->
+            <Grid Grid.Column="0">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="10"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+
+              <!-- Cell Inspector card -->
+              <Border Grid.Row="0" Background="#252528" CornerRadius="6"
+                      BorderBrush="#3E3E42" BorderThickness="1" Padding="14,12">
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="6"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                  </Grid.RowDefinitions>
+                  <!-- Type / Value / Sheet row -->
+                  <StackPanel Grid.Row="0" Orientation="Horizontal">
+                    <TextBlock Text="Type: "  Foreground="#909090" FontSize="11"/>
+                    <TextBlock x:Name="FaCellTypeTxt"  Text="—" Foreground="#B0B0B0"
+                               FontSize="11" FontWeight="SemiBold"/>
+                    <TextBlock Text="     Value: " Foreground="#909090" FontSize="11"/>
+                    <TextBlock x:Name="FaCellValueTxt" Text="—" Foreground="#B0B0B0" FontSize="11"/>
+                    <TextBlock Text="     Sheet: " Foreground="#909090" FontSize="11"/>
+                    <TextBlock x:Name="FaCellSheetTxt" Text="—" Foreground="#B0B0B0" FontSize="11"/>
+                  </StackPanel>
+                  <!-- Precedents label -->
+                  <TextBlock Grid.Row="2"
+                             Text="Precedents — click → to navigate:"
+                             Foreground="#909090" FontSize="11"/>
+                  <!-- Precedents container -->
+                  <Border Grid.Row="4" Background="#1B1B1F" CornerRadius="4"
+                          BorderBrush="#3E3E42" BorderThickness="1"
+                          MinHeight="34" MaxHeight="90">
+                    <Grid>
+                      <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel x:Name="FaPrecedentsPanel" Margin="6,3"/>
+                      </ScrollViewer>
+                      <TextBlock x:Name="FaNoPrecedentsTxt"
+                                 Text="No precedents — cell is hardcoded or empty."
+                                 Foreground="#6E6E6E" FontSize="11"
+                                 Margin="10,8" Visibility="Collapsed"/>
+                    </Grid>
+                  </Border>
+                  <!-- Dependents count -->
+                  <StackPanel Grid.Row="6" Orientation="Horizontal">
+                    <TextBlock Text="Dependents: " Foreground="#909090" FontSize="11"/>
+                    <TextBlock x:Name="FaDependentCountTxt" Text="—"
+                               Foreground="#B0B0B0" FontSize="11"/>
+                  </StackPanel>
+                </Grid>
+              </Border>
+
+              <!-- SUMIF / COUNTIF / AVERAGEIF Visualizer card -->
+              <Border Grid.Row="2" Background="#252528" CornerRadius="6"
+                      BorderBrush="#3E3E42" BorderThickness="1">
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                  </Grid.RowDefinitions>
+                  <!-- Header -->
+                  <Border Grid.Row="0" Background="#222225" CornerRadius="6,6,0,0"
+                          BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,8">
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="0" x:Name="FaSumifTitleTxt"
+                                 Text="SUMIF Visualizer — inspect a SUMIF / SUMIFS / COUNTIF / AVERAGEIF cell"
+                                 Foreground="#909090" FontSize="11" FontWeight="SemiBold"/>
+                      <TextBlock Grid.Column="1" x:Name="FaSumifTotalTxt"
+                                 Text="" Foreground="#4C9FE6" FontSize="12" FontWeight="Bold"/>
+                    </Grid>
+                  </Border>
+                  <!-- Body: hint OR DataGrid -->
+                  <Grid Grid.Row="1">
+                    <TextBlock x:Name="FaSumifEmptyTxt" Visibility="Visible"
+                               Text="Inspect a SUMIF, SUMIFS, COUNTIF, COUNTIFS, AVERAGEIF, or AVERAGEIFS cell to see which rows contribute to the result.  Matching rows are highlighted here and (temporarily) in the spreadsheet — no edits are ever made."
+                               Foreground="#6E6E6E" FontSize="11" TextWrapping="Wrap"
+                               Margin="14,10" VerticalAlignment="Top"/>
+                    <DataGrid x:Name="FaSumifGrid"
+                              AutoGenerateColumns="False" IsReadOnly="True"
+                              SelectionMode="Single" GridLinesVisibility="Horizontal"
+                              Background="Transparent"
+                              RowBackground="#252528" AlternatingRowBackground="#202023"
+                              Foreground="#E0E0E0" BorderThickness="0"
+                              ColumnHeaderHeight="28" RowHeight="24"
+                              FontSize="11" HeadersVisibility="Column"
+                              Visibility="Collapsed">
+                      <DataGrid.Resources>
+                        <Style TargetType="DataGridColumnHeader">
+                          <Setter Property="Background"      Value="#222225"/>
+                          <Setter Property="Foreground"      Value="#A0A0A0"/>
+                          <Setter Property="FontSize"        Value="11"/>
+                          <Setter Property="FontWeight"      Value="SemiBold"/>
+                          <Setter Property="Padding"         Value="8,0"/>
+                          <Setter Property="BorderBrush"     Value="#3E3E42"/>
+                          <Setter Property="BorderThickness" Value="0,0,1,1"/>
+                        </Style>
+                        <Style TargetType="DataGridRow">
+                          <Setter Property="BorderThickness" Value="0"/>
+                          <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsMatch}" Value="True">
+                              <Setter Property="Background" Value="#1A3A1A"/>
+                            </DataTrigger>
+                            <Trigger Property="IsSelected" Value="True">
+                              <Setter Property="Background" Value="#1A2A3E"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                              <Setter Property="Background" Value="#2D2D30"/>
+                            </Trigger>
+                          </Style.Triggers>
+                        </Style>
+                        <Style TargetType="DataGridCell">
+                          <Setter Property="BorderThickness" Value="0"/>
+                          <Setter Property="Padding"         Value="6,0"/>
+                          <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                              <Setter Property="Background" Value="Transparent"/>
+                              <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                          </Style.Triggers>
+                        </Style>
+                      </DataGrid.Resources>
+                      <DataGrid.Columns>
+                        <DataGridTextColumn Header="Row"  Binding="{Binding RowNum}"      Width="50"/>
+                        <DataGridTextColumn Header="✓"    Binding="{Binding MatchSymbol}" Width="30"/>
+                        <DataGridTextColumn Header="Criteria Value"
+                                            Binding="{Binding CriteriaVal}" Width="*"/>
+                        <DataGridTextColumn Header="Sum / Count Value"
+                                            Binding="{Binding SumVal}"      Width="110"/>
+                      </DataGrid.Columns>
+                    </DataGrid>
+                  </Grid>
+                </Grid>
+              </Border>
+            </Grid>
+
+            <!-- Right column: Dependency Tree -->
+            <Border Grid.Column="2" Background="#252528" CornerRadius="6"
+                    BorderBrush="#3E3E42" BorderThickness="1">
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0" Background="#222225" CornerRadius="6,6,0,0"
+                        BorderBrush="#3E3E42" BorderThickness="0,0,0,1" Padding="14,8">
+                  <TextBlock Text="Dependency Tree"
+                             Foreground="#B0B0B0" FontSize="12" FontWeight="SemiBold"/>
+                </Border>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="8,6">
+                  <StackPanel>
+                    <TextBlock Text="↑ PRECEDENTS (reads from):"
+                               Foreground="#909090" FontSize="10" FontWeight="SemiBold"
+                               Margin="0,2,0,4"/>
+                    <TreeView x:Name="FaPrecedentsTree"
+                              Background="Transparent" BorderThickness="0"
+                              Foreground="#B0B0B0" FontSize="11">
+                      <TreeView.ItemContainerStyle>
+                        <Style TargetType="TreeViewItem">
+                          <Setter Property="Background"  Value="Transparent"/>
+                          <Setter Property="Foreground"  Value="#B0B0B0"/>
+                          <Setter Property="Padding"     Value="2,2"/>
+                          <Setter Property="IsExpanded"  Value="True"/>
+                          <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                              <Setter Property="Background" Value="#1A2A3E"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                              <Setter Property="Background" Value="#2D2D30"/>
+                            </Trigger>
+                          </Style.Triggers>
+                        </Style>
+                      </TreeView.ItemContainerStyle>
+                    </TreeView>
+                    <TextBlock Text="↓ DEPENDENTS (used by):"
+                               Foreground="#909090" FontSize="10" FontWeight="SemiBold"
+                               Margin="0,14,0,4"/>
+                    <TreeView x:Name="FaDependentsTree"
+                              Background="Transparent" BorderThickness="0"
+                              Foreground="#B0B0B0" FontSize="11">
+                      <TreeView.ItemContainerStyle>
+                        <Style TargetType="TreeViewItem">
+                          <Setter Property="Background"  Value="Transparent"/>
+                          <Setter Property="Foreground"  Value="#B0B0B0"/>
+                          <Setter Property="Padding"     Value="2,2"/>
+                          <Setter Property="IsExpanded"  Value="True"/>
+                          <Style.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                              <Setter Property="Background" Value="#1A2A3E"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                              <Setter Property="Background" Value="#2D2D30"/>
+                            </Trigger>
+                          </Style.Triggers>
+                        </Style>
+                      </TreeView.ItemContainerStyle>
+                    </TreeView>
+                  </StackPanel>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+          </Grid>
+
+          <!-- Range Audit footer strip -->
+          <Border Grid.Row="4" Background="#252528" CornerRadius="6"
+                  BorderBrush="#3E3E42" BorderThickness="1" Padding="14,10">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="6"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <StackPanel Grid.Row="0" Orientation="Horizontal">
+                <TextBlock Text="Range Audit:" Foreground="#909090" FontSize="11"
+                           FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock x:Name="FaRangeAddrTxt" Text="—" Foreground="#4C9FE6"
+                           FontSize="11" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <TextBlock Text="Formulas:" Foreground="#909090" FontSize="11"
+                           VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="FaRangeFormulaTxt" Text="—" Foreground="#B0B0B0"
+                           FontSize="11" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <TextBlock Text="Hardcoded:" Foreground="#909090" FontSize="11"
+                           VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="FaRangeHardcodedTxt" Text="—" Foreground="#B0B0B0"
+                           FontSize="11" VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <TextBlock x:Name="FaRangeExternalTxt" Text="" Foreground="#E07000"
+                           FontSize="11" FontWeight="Bold" VerticalAlignment="Center"/>
+              </StackPanel>
+              <TextBlock Grid.Row="2" x:Name="FaRangeDetailTxt"
+                         Text="Select a range in Excel and click Audit Range to analyze formula consistency. Formula cells will be given a temporary blue glow in the spreadsheet — click Clear Highlights to remove."
+                         Foreground="#6E6E6E" FontSize="11" TextWrapping="Wrap"/>
+            </Grid>
+          </Border>
+
+        </Grid>
+      </TabItem>
+
     </TabControl>
 
     <Border Grid.Row="2" Background="#252528" BorderBrush="#3E3E42" BorderThickness="0,1,0,0">
@@ -3772,11 +4318,14 @@ $xamlStr = @"
 # ================================================================
 #  BUILD WINDOW + BIND ELEMENTS
 # ================================================================
+# Parse the XAML string into a live WPF Window object.
+# XamlReader.Load is the standard way to instantiate XAML from a string in PS 5.1.
 $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xamlStr))
 $Window = [System.Windows.Markup.XamlReader]::Load($reader)
 $script:Window = $Window
 
-# Helper to find named elements
+# Shortcut: FindName looks up a named XAML element; e.g. G 'ClipWbCombo' returns
+# the ComboBox whose x:Name="ClipWbCombo" was declared in the XAML above.
 function G([string]$n) { $Window.FindName($n) }
 
 # -- Global UI refs --
@@ -3797,8 +4346,8 @@ $ClipSheetCombo   = G 'ClipSheetCombo'
 $ClipCellBox      = G 'ClipCellBox'
 $ClipRefreshBtn   = G 'ClipRefreshBtn'
 $ClipTimestampChk = G 'ClipTimestampChk'
-$ClipDateOffset   = G 'ClipDateOffset'
-$ClipTimeOffset   = G 'ClipTimeOffset'
+$ClipDateCell     = G 'ClipDateCell'
+$ClipTimeCell     = G 'ClipTimeCell'
 $ClipSlotsPanel   = G 'ClipSlotsPanel'
 $ClipSlotCount    = G 'ClipSlotCount'
 $ClipAddSlotBtn   = G 'ClipAddSlotBtn'
@@ -3935,6 +4484,32 @@ $FidxStatusTxt     = G 'FidxStatusTxt'
 $FidxTotalCount    = G 'FidxTotalCount'
 $FidxLastScanTxt   = G 'FidxLastScanTxt'
 
+# -- Formula Auditor tab --
+$FaActiveCellTxt        = G 'FaActiveCellTxt'
+$FaFormulaTxt           = G 'FaFormulaTxt'
+$FaInspectBtn           = G 'FaInspectBtn'
+$FaBackBtn              = G 'FaBackBtn'
+$FaAuditRangeBtn        = G 'FaAuditRangeBtn'
+$FaClearHighlightsBtn   = G 'FaClearHighlightsBtn'
+$FaAutoBox              = G 'FaAutoBox'
+$FaCellTypeTxt          = G 'FaCellTypeTxt'
+$FaCellValueTxt         = G 'FaCellValueTxt'
+$FaCellSheetTxt         = G 'FaCellSheetTxt'
+$FaPrecedentsPanel      = G 'FaPrecedentsPanel'
+$FaNoPrecedentsTxt      = G 'FaNoPrecedentsTxt'
+$FaDependentCountTxt    = G 'FaDependentCountTxt'
+$FaSumifTitleTxt        = G 'FaSumifTitleTxt'
+$FaSumifTotalTxt        = G 'FaSumifTotalTxt'
+$FaSumifEmptyTxt        = G 'FaSumifEmptyTxt'
+$FaSumifGrid            = G 'FaSumifGrid'
+$FaPrecedentsTree       = G 'FaPrecedentsTree'
+$FaDependentsTree       = G 'FaDependentsTree'
+$FaRangeAddrTxt         = G 'FaRangeAddrTxt'
+$FaRangeFormulaTxt      = G 'FaRangeFormulaTxt'
+$FaRangeHardcodedTxt    = G 'FaRangeHardcodedTxt'
+$FaRangeExternalTxt     = G 'FaRangeExternalTxt'
+$FaRangeDetailTxt       = G 'FaRangeDetailTxt'
+
 # ================================================================
 #  SYNC LOG WRITER (appends to the QSync log textbox)
 # ================================================================
@@ -3951,7 +4526,12 @@ function QsLog([string]$msg) {
 # ================================================================
 #  REFRESH FUNCTIONS: MacroHub tabs
 # ================================================================
+# Each Refresh-* function re-queries its data source and repopulates the
+# corresponding UI control(s), preserving the previously selected item when
+# possible.  They are called both on tab activation and by explicit refresh buttons.
 
+# Re-queries open workbooks from Excel Main session and updates the Clipboard and
+# Macros workbook combo boxes, then cascades to sheet list refreshes.
 function Refresh-WorkbookDropdowns {
     $wbs = Get-OpenWorkbooks -Session Main
     foreach ($combo in @($ClipWbCombo, $MacroWbCombo)) {
@@ -3974,6 +4554,8 @@ function Refresh-WorkbookDropdowns {
     }
 }
 
+# Populates the hidden default sheet combo and every per-slot sheet combo from
+# the currently selected workbook in the Clipboard tab.
 function Refresh-ClipSheets {
     if (-not $ClipWbCombo) { return }
     $wb = $ClipWbCombo.SelectedItem
@@ -4042,8 +4624,8 @@ function Ensure-ClipSlotStateByIndex([int]$Index) {
             -DefaultSheet ([string]$ClipSheetCombo.SelectedItem) `
             -DefaultCell $ClipCellBox.Text `
             -DefaultTimestamp ([bool]$ClipTimestampChk.IsChecked) `
-            -DefaultDateOffset $ClipDateOffset.Text `
-            -DefaultTimeOffset $ClipTimeOffset.Text `
+            -DefaultDateCell $ClipDateCell.Text `
+            -DefaultTimeCell $ClipTimeCell.Text `
             -CountLabel $ClipSlotCount
         Refresh-ClipSheets
     }
@@ -4086,6 +4668,8 @@ function Refresh-MacroSheets {
     if ($MacroSheetCombo.Items.Count -gt 0) { $MacroSheetCombo.SelectedIndex = 0 }
 }
 
+# Scans the Macros/ folder and repopulates the MacroList, placing favorited macros
+# at the top with a [*] prefix; also repopulates the Scheduler macro combo.
 function Refresh-MacroList {
     $MacroList.Items.Clear()
     $SchedMacroCombo.Items.Clear()
@@ -4163,6 +4747,8 @@ function Refresh-TaskList {
     }
 }
 
+# Populates the Navigator workbook list from the Navigator Excel session and
+# cascades to the destination workbook combo, Excel options, and VBA list.
 function Refresh-NavWorkbooks {
     $NavWbList.Items.Clear()
     $wbs = Get-OpenWorkbooks -Session Navigator
@@ -4173,6 +4759,8 @@ function Refresh-NavWorkbooks {
     Refresh-NavVbaList
 }
 
+# Enumerates all worksheets in the selected workbook and shows each in the
+# Navigator sheet list with a colored dot indicating visible/hidden/very-hidden state.
 function Refresh-NavSheets {
     $NavSheetList.Items.Clear()
     $wb = $NavWbList.SelectedItem
@@ -4184,10 +4772,11 @@ function Refresh-NavSheets {
             for ($i = 1; $i -le $wbObj.Worksheets.Count; $i++) {
                 $ws = $wbObj.Worksheets.Item($i)
                 $state = [int]$ws.Visible
+                # Excel sheet Visible constants: -1=xlSheetVisible, 0=xlSheetHidden, 2=xlSheetVeryHidden
                 $dotColor = switch ($state) {
-                    -1 { '#50A050' }   # visible
-                    0  { '#FFFFFF' }   # hidden
-                    2  { '#000000' }   # very hidden
+                    -1 { '#50A050' }   # visible  = green dot
+                    0  { '#FFFFFF' }   # hidden   = white dot
+                    2  { '#000000' }   # very hidden = black dot (cannot be unhidden via UI in Excel)
                     default { '#6E6E6E' }
                 }
                 $suffix = switch ($state) {
@@ -4307,6 +4896,7 @@ function Refresh-NavExcelOptions {
         $xl = Get-ExcelApp -Session Navigator
         if (-not $xl) { return }
         $calcMode = [int]$xl.Calculation
+        # Excel Calculation constants: -4105=xlAutomatic, -4135=xlManual, -4134=xlSemiautomatic
         $label = switch ($calcMode) {
             -4105 { 'Automatic' }
             -4135 { 'Manual' }
@@ -4332,7 +4922,12 @@ function Refresh-TemplateList {
 # ================================================================
 #  REFRESH FUNCTIONS: QuarterSync tabs
 # ================================================================
+# Refresh-QsProgress updates the big stat cards and per-folder progress bars
+# on the QSync tab using the current compare results from qs_compare_results.json.
+# Refresh-QsTodoList rebuilds the scrollable QTasks list with optional filters.
 
+# Recomputes completion percentages from qs_compare_results.json and updates the
+# stat cards, percentage label colors, and folder progress bars on the QSync tab.
 function Refresh-QsProgress {
     $todos   = Load-QsCompareTodos
     $total   = $todos.Count
@@ -4401,6 +4996,8 @@ function Refresh-QsProgress {
         $fill.CornerRadius = [System.Windows.CornerRadius]::new(3)
         $fill.HorizontalAlignment = 'Left'
         $pctVal = $gpct
+        # Add_Loaded fires once after layout pass so ActualWidth is valid; setting
+        # fill width in a constructor would give 0 because layout has not run yet.
         $track.Add_Loaded({
             $fill.Width = ($track.ActualWidth * $pctVal / 100)
         }.GetNewClosure())
@@ -4559,6 +5156,8 @@ function New-QsTodoRow($todo, [string]$compareLabel) {
     return $row
 }
 
+# Clears and rebuilds the QTasks scrollable panel, applying the current status /
+# name / folder filters and sorting pending items before completed ones.
 function Refresh-QsTodoList {
     $QsTodoPanel.Children.Clear()
     $todos = Load-QsCompareTodos
@@ -4675,8 +5274,12 @@ Set-ClipSequenceUiState $false
 # ================================================================
 #  EVENT HANDLERS
 # ================================================================
+# All Add_Click / Add_SelectionChanged handlers are wired here, after the
+# Refresh-* functions are defined so closures can reference them freely.
 
 # -- Clipboard tab --
+# Handlers for workbook selection, slot add/remove, record/stop, sequence
+# capture, paste, and defaults lock/clear on the Clipboard tab.
 $ClipWbCombo.Add_SelectionChanged({ Refresh-ClipSheets })
 
 $ClipRefreshBtn.Add_Click({
@@ -4695,8 +5298,8 @@ $ClipAddSlotBtn.Add_Click({
         -DefaultSheet ([string]$ClipSheetCombo.SelectedItem) `
         -DefaultCell $ClipCellBox.Text `
         -DefaultTimestamp ([bool]$ClipTimestampChk.IsChecked) `
-        -DefaultDateOffset $ClipDateOffset.Text `
-        -DefaultTimeOffset $ClipTimeOffset.Text `
+        -DefaultDateCell $ClipDateCell.Text `
+        -DefaultTimeCell $ClipTimeCell.Text `
         -CountLabel $ClipSlotCount
     Set-Status "Added slot $($script:ClipSlotIdx)"
 })
@@ -4770,22 +5373,22 @@ $ClipLockBtn.Add_Click({
     $cell = if ($slot -and $slot.CellBox) { [string]$slot.CellBox.Text } else { [string]$ClipCellBox.Text }
     $cell = $cell.Trim()
     if (-not $cell) { $cell = 'A1' }
-    $ts = if ($slot -and $slot.TimestampChk) { [bool]$slot.TimestampChk.IsChecked } else { [bool]$ClipTimestampChk.IsChecked }
-    $dOff = if ($slot -and $slot.DateOffsetBox) { [string]$slot.DateOffsetBox.Text } else { [string]$ClipDateOffset.Text }
-    $tOff = if ($slot -and $slot.TimeOffsetBox) { [string]$slot.TimeOffsetBox.Text } else { [string]$ClipTimeOffset.Text }
+    $ts   = if ($slot -and $slot.TimestampChk) { [bool]$slot.TimestampChk.IsChecked } else { [bool]$ClipTimestampChk.IsChecked }
+    $dCell = if ($slot -and $slot.DateCellBox) { [string]$slot.DateCellBox.Text } else { [string]$ClipDateCell.Text }
+    $tCell = if ($slot -and $slot.TimeCellBox) { [string]$slot.TimeCellBox.Text } else { [string]$ClipTimeCell.Text }
 
     # Keep hidden defaults controls in sync (used when creating future slots).
     if ($sh -and $ClipSheetCombo -and $ClipSheetCombo.Items.Contains($sh)) { $ClipSheetCombo.SelectedItem = $sh }
     $ClipCellBox.Text = $cell
     $ClipTimestampChk.IsChecked = $ts
-    $ClipDateOffset.Text = $dOff
-    $ClipTimeOffset.Text = $tOff
+    $ClipDateCell.Text = $dCell
+    $ClipTimeCell.Text = $tCell
 
     Save-ClipDefaults -Workbook ([string]$wb) -Sheet ([string]$sh) -Cell $cell `
-        -Timestamp $ts -DateOffset $dOff -TimeOffset $tOff
+        -Timestamp $ts -DateCell $dCell -TimeCell $tCell
     $ClipDefaultsIndicator.Text = "(defaults: $wb > $sh > $cell)"
     $ClipDefaultsIndicator.Visibility = 'Visible'
-    Set-Status "Defaults locked (workbook + slot settings): $wb > $sh > $cell | Timestamp=$ts | Date=$dOff Time=$tOff"
+    Set-Status "Defaults locked (workbook + slot settings): $wb > $sh > $cell | Timestamp=$ts | Date→$dCell Time→$tCell"
 })
 
 $ClipClearDefaultsBtn.Add_Click({
@@ -4813,6 +5416,7 @@ Refresh workbook/email data -> filter/select target -> run action -> verify stat
 })
 
 # -- Macros tab --
+# Handlers for macro list selection, run, favorite toggle, and workbook/sheet refresh.
 $MacroRefreshBtn.Add_Click({
     Refresh-WorkbookDropdowns
     Refresh-MacroList
@@ -4873,6 +5477,8 @@ $MacroFavBtn.Add_Click({
 })
 
 # -- Scheduler tab --
+# Handlers for opening the Macros folder, refreshing the task list, and creating
+# new scheduled tasks via Register-HubTask.
 $SchedOpenFolderBtn.Add_Click({
     # Create the folder if it doesn't exist, then open it
     if (-not (Test-Path $script:MacroFolder)) {
@@ -4908,6 +5514,9 @@ $SchedCreateBtn.Add_Click({
 })
 
 # -- Navigator tab --
+# Handlers for workbook/sheet list refresh, drag-drop sheet reorder, sheet
+# activate/open/close/hide/unhide/delete/rename, move-copy, export, password
+# management, Excel window controls, and VBA macro execution.
 $NavRefreshBtn.Add_Click({
     Refresh-NavWorkbooks
     Refresh-WorkbookDropdowns
@@ -5223,7 +5832,7 @@ $NavActivateBtn.Add_Click({
         $ws = $xl.Workbooks.Item($wb).Worksheets.Item($shName)
         if ($ws.Visible -ne -1) { $ws.Visible = -1 }
         $xl.Visible = $true
-        $xl.WindowState = -4143 # xlNormal
+        $xl.WindowState = -4143 # xlNormal (restore from minimized/maximized)
         $ws.Activate()
         Set-Status "Activated: $wb > $shName"
         Write-ActivityLog "Activated sheet: $wb > $shName"
@@ -5335,7 +5944,7 @@ $NavExportSheetBtn.Add_Click({
         $ws.Copy()
         $newWb = $xl.ActiveWorkbook
         $ext = [System.IO.Path]::GetExtension($dlg.FileName).ToLower()
-        $format = if ($ext -eq '.csv') { 6 } else { 51 }
+        $format = if ($ext -eq '.csv') { 6 } else { 51 }  # 6=xlCSV, 51=xlOpenXMLWorkbook
         $newWb.SaveAs($dlg.FileName, $format)
         $newWb.Close($false)
         Set-Status "Exported sheet: $shName"
@@ -5504,10 +6113,11 @@ $NavApplyExcelOptsBtn.Add_Click({
         $xl = Get-ExcelApp -Session Navigator
         if (-not $xl) { Set-Status 'Navigator Excel session is not open' '#E05050'; return }
         $mode = if ($NavCalcModeCombo.SelectedItem) { $NavCalcModeCombo.SelectedItem.Content.ToString() } else { 'Automatic' }
+        # Map label back to Excel xlCalculation constants
         $xl.Calculation = switch ($mode) {
             'Manual'        { -4135 }
             'Semiautomatic' { -4134 }
-            default         { -4105 }
+            default         { -4105 }   # xlAutomatic
         }
         $xl.EnableEvents = [bool]$NavEventsChk.IsChecked
         Set-Status "Excel options updated: Calc=$mode, Events=$($xl.EnableEvents)"
@@ -5516,6 +6126,8 @@ $NavApplyExcelOptsBtn.Add_Click({
 })
 
 # -- Templates tab --
+# Handlers for template list selection, save (upsert), delete, paste to Excel,
+# and preview toggle with {DATE}/{SHEET}/{USER} placeholder substitution.
 $TplList.Add_SelectionChanged({
     $sel = $TplList.SelectedItem
     if ($sel) {
@@ -5609,6 +6221,8 @@ $TplPreviewBtn.Add_Click({
 })
 
 # -- QSync tab --
+# Handlers for folder browse buttons and the Run Sync button that calls
+# Invoke-QuarterSync and displays the result cards.
 $QsBrowseLast.Add_Click({
     $d = [System.Windows.Forms.FolderBrowserDialog]::new()
     $d.Description = 'Select Last Quarter Root Folder'
@@ -5672,6 +6286,9 @@ $QsRunSyncBtn.Add_Click({
 })
 
 # -- QTasks tab --
+# Handlers for Source A / Target B folder selection, Compare Missing button,
+# swap folders, filter controls, status toggle on individual todo rows, and
+# the Export to Excel button.
 $QsQuarterCombo.Add_SelectionChanged({
     if (Get-ComboText $QsQuarterCombo) {
         Save-QsCompareConfigFromUi
@@ -5769,6 +6386,10 @@ $QsExportBtn.Add_Click({
 # ================================================================
 #  ALT KEYTIP OVERLAY (Excel-style letter badges)
 # ================================================================
+# Pressing Alt alone shows coloured letter badges over every interactive control
+# on the active tab.  Pressing the indicated letter then activates that control.
+# Buttons derive their letter from the underscore prefix in their Content string
+# (e.g. '_Run' -> R); other controls use the $ExtraKeyTips registry below.
 $script:KeyTipsActive = $false
 
 # Registry: extra keytips for non-button controls (name -> letter)
@@ -5809,6 +6430,9 @@ $script:ExtraKeyTips = @{
     QsScanPathBox     = 'X'   # path boX
 }
 
+# Walks the WPF visual tree, collects visible interactive controls, positions a
+# coloured letter badge over each one, and stores the letter->control mapping in
+# $script:KeyTipMap for dispatch by the PreviewKeyDown handler.
 function Show-KeyTips {
     $KeyTipCanvas.Children.Clear()
     $KeyTipCanvas.Visibility = 'Visible'
@@ -5922,17 +6546,50 @@ function Get-TabIndexFromDigitKey([object]$keyObj) {
 
 function Select-MainTabIndex([int]$idx) {
     if ($idx -lt 0 -or $idx -ge $MainTabs.Items.Count) { return $false }
+    $tab = $MainTabs.Items[$idx]
+    if ($tab -is [System.Windows.Controls.TabItem] -and $tab.Visibility -eq 'Collapsed') { return $false }
     $MainTabs.SelectedIndex = $idx
     return $true
 }
 
+# Returns a list of visible TabItem objects in order
+function Get-VisibleTabs {
+    $result = @()
+    for ($i = 0; $i -lt $MainTabs.Items.Count; $i++) {
+        $t = $MainTabs.Items[$i]
+        if (-not ($t -is [System.Windows.Controls.TabItem]) -or $t.Visibility -ne 'Collapsed') {
+            $result += [PSCustomObject]@{ Tab = $t; AbsIndex = $i }
+        }
+    }
+    return $result
+}
+
+# Select the Nth visible tab (1-based position among visible tabs)
+function Select-VisibleTabByPosition([int]$pos) {
+    $visible = Get-VisibleTabs
+    if ($pos -lt 1 -or $pos -gt $visible.Count) { return $false }
+    $MainTabs.SelectedIndex = $visible[$pos - 1].AbsIndex
+    return $true
+}
+
 function Select-MainTabRelative([int]$delta) {
-    if ($MainTabs.Items.Count -le 0) { return $false }
-    $MainTabs.SelectedIndex = ($MainTabs.SelectedIndex + $delta + $MainTabs.Items.Count) % $MainTabs.Items.Count
+    $visible = Get-VisibleTabs
+    if ($visible.Count -le 0) { return $false }
+    # Find current position among visible tabs
+    $curAbs = $MainTabs.SelectedIndex
+    $curVis = -1
+    for ($i = 0; $i -lt $visible.Count; $i++) {
+        if ($visible[$i].AbsIndex -eq $curAbs) { $curVis = $i; break }
+    }
+    if ($curVis -lt 0) { $curVis = 0 }
+    $nextVis = ($curVis + $delta + $visible.Count) % $visible.Count
+    $MainTabs.SelectedIndex = $visible[$nextVis].AbsIndex
     return $true
 }
 
 # -- Keyboard shortcuts: Alt+0-9 / Ctrl+0-9 / Ctrl+PgUp/PgDn tab switch, Ctrl+F search --
+# PreviewKeyDown fires before focused controls see the key, allowing tab-switch
+# shortcuts to work even when a TextBox has focus.
 $Window.Add_PreviewKeyDown({
     $mods = [System.Windows.Input.Keyboard]::Modifiers
     $ctrlDown = (($mods -band [System.Windows.Input.ModifierKeys]::Control) -ne 0)
@@ -5985,13 +6642,17 @@ $Window.Add_PreviewKeyDown({
         }
     }
 
-    # Alt+0..9 tab switching (SystemKey path catches Alt+digit reliably)
+    # Alt+1..9 tab switching by visible-tab position (SystemKey path catches Alt+digit reliably)
     if ($_.Key -eq 'System') {
         $altNum = Get-TabIndexFromDigitKey $_.SystemKey
-        if ($altNum -ge 0 -and (Select-MainTabIndex $altNum)) {
-            if ($script:KeyTipsActive) { Hide-KeyTips }
-            $_.Handled = $true
-            return
+        if ($altNum -ge 0) {
+            # altNum is 0-based absolute from digit keys (D1→0, D2→1, …); treat as 1-based visible position
+            $visPos = $altNum + 1
+            if ($visPos -ge 1 -and (Select-VisibleTabByPosition $visPos)) {
+                if ($script:KeyTipsActive) { Hide-KeyTips }
+                $_.Handled = $true
+                return
+            }
         }
     }
 
@@ -6260,7 +6921,43 @@ $Window.Add_Closed({
 # ================================================================
 #  INITIAL LOAD  (defers heavy tab work until first visit)
 # ================================================================
+# Runs at window creation time (before ShowDialog).  Heavy per-tab data is loaded
+# lazily via the Add_SelectionChanged handler so startup is fast even when Excel
+# is not open.  Tabs 0, 1, 4, and 5 are considered always-loaded immediately.
 $script:TabsLoaded = @{}   # track which tabs have been lazy-loaded
+
+# ================================================================
+#  APPLY -HideTabs: collapse tabs listed in the parameter
+# ================================================================
+if ($HideTabs -and $HideTabs.Trim()) {
+    # Canonical map: header text → TabItem
+    $tabHeaderMap = @{}
+    for ($i = 0; $i -lt $MainTabs.Items.Count; $i++) {
+        $t = $MainTabs.Items[$i]
+        if ($t -is [System.Windows.Controls.TabItem]) {
+            $tabHeaderMap[[string]$t.Header] = $t
+        }
+    }
+    foreach ($name in ($HideTabs -split ',')) {
+        $name = $name.Trim()
+        if (-not $name) { continue }
+        # Case-insensitive lookup
+        $matched = $tabHeaderMap.Keys | Where-Object { $_ -ieq $name } | Select-Object -First 1
+        if ($matched) {
+            $tabHeaderMap[$matched].Visibility = 'Collapsed'
+        }
+    }
+    # Ensure the currently selected tab is visible; if not, jump to first visible tab
+    $curTab = $MainTabs.Items[$MainTabs.SelectedIndex]
+    if ($curTab -is [System.Windows.Controls.TabItem] -and $curTab.Visibility -eq 'Collapsed') {
+        for ($i = 0; $i -lt $MainTabs.Items.Count; $i++) {
+            $t = $MainTabs.Items[$i]
+            if (-not ($t -is [System.Windows.Controls.TabItem]) -or $t.Visibility -ne 'Collapsed') {
+                $MainTabs.SelectedIndex = $i; break
+            }
+        }
+    }
+}
 
 # Load workbook lists first so defaults can be applied safely.
 Refresh-WorkbookDropdowns
@@ -6282,8 +6979,11 @@ if ($clipDef) {
         }
         if ($clipDef.Cell) { $ClipCellBox.Text = $clipDef.Cell }
         if ($null -ne $clipDef.Timestamp) { $ClipTimestampChk.IsChecked = [bool]$clipDef.Timestamp }
-        if ($clipDef.DateOffset) { $ClipDateOffset.Text = $clipDef.DateOffset }
-        if ($clipDef.TimeOffset) { $ClipTimeOffset.Text = $clipDef.TimeOffset }
+        # Load timestamp cell addresses — fall back gracefully from old offset-based format.
+        if ($clipDef.DateCell) { $ClipDateCell.Text = $clipDef.DateCell }
+        elseif ($clipDef.DateOffset) { $ClipDateCell.Text = 'A3' }   # migrate: old offset → new default
+        if ($clipDef.TimeCell) { $ClipTimeCell.Text = $clipDef.TimeCell }
+        elseif ($clipDef.TimeOffset) { $ClipTimeCell.Text = 'A2' }   # migrate: old offset → new default
         $wb2 = if ($clipDef.Workbook) { $clipDef.Workbook } else { '?' }
         $sh2 = if ($clipDef.Sheet) { $clipDef.Sheet } else { '?' }
         $cl2 = if ($clipDef.Cell) { $clipDef.Cell } else { 'A1' }
@@ -6297,8 +6997,8 @@ Add-ClipSlotUI -Panel $ClipSlotsPanel -WbCombo $ClipWbCombo `
     -DefaultSheet ([string]$ClipSheetCombo.SelectedItem) `
     -DefaultCell $ClipCellBox.Text `
     -DefaultTimestamp ([bool]$ClipTimestampChk.IsChecked) `
-    -DefaultDateOffset $ClipDateOffset.Text `
-    -DefaultTimeOffset $ClipTimeOffset.Text `
+    -DefaultDateCell $ClipDateCell.Text `
+    -DefaultTimeCell $ClipTimeCell.Text `
     -CountLabel $ClipSlotCount
 Refresh-ClipSheets
 Refresh-MacroList
@@ -6336,7 +7036,8 @@ try {
     }
 } catch {}
 
-# Lazy-load tab content on first visit
+# Lazy-load tab content on first visit: tabs 2, 3, 6 hit external COM/JSON on
+# first activation so they are deferred; all other tabs were loaded at startup.
 $MainTabs.Add_SelectionChanged({
     $idx = $MainTabs.SelectedIndex
 
@@ -6454,13 +7155,606 @@ $FidxGrid.Add_KeyDown({
     }
 })
 
-# Mark Tab 0 (Clipboard) + Tab 1 (Macros) + Tab 4 (Templates) as already loaded
+# ================================================================
+#  FORMULA AUDITOR — state, helpers, logic, event wiring
+# ================================================================
+
+# ---- State ----
+$script:FaNavHistory            = [System.Collections.ArrayList]::new()
+$script:FaLastCellSig           = ''
+# Highlight undo stacks — each entry: @{ Cell = <COM Range>; OrigBorders = <hashtable>; OrigInterior = <hashtable> }
+$script:FaHighlightBorderCells  = [System.Collections.ArrayList]::new()
+$script:FaHighlightInteriorCells = [System.Collections.ArrayList]::new()
+
+# Excel color helpers (R + G*256 + B*65536)
+$script:FaBlueBorderColor  = [long](76  + 159*256 + 230*65536)  # #4C9FE6
+$script:FaGreenFillColor   = [long](144 + 238*256 + 144*65536)  # light green  (#90EE90)
+$script:FaBlueFillColor    = [long](173 + 216*256 + 230*65536)  # light blue   (#ADD8E6)
+
+# ---- Border save/restore ----
+function Save-FaCellBorderState {
+    param($Cell)
+    $s = @{}
+    foreach ($edge in @(7, 8, 9, 10)) {   # Left=7 Top=8 Bottom=9 Right=10
+        try {
+            $b = $Cell.Borders($edge)
+            $s[$edge] = @{ LineStyle = $b.LineStyle; Weight = $b.Weight;
+                           Color = $b.Color; ColorIndex = $b.ColorIndex }
+        } catch { $s[$edge] = $null }
+    }
+    return $s
+}
+
+function Restore-FaCellBorderState {
+    param($Cell, $State)
+    foreach ($edge in @(7, 8, 9, 10)) {
+        $s = $State[$edge]
+        if ($null -eq $s) { continue }
+        try {
+            $b = $Cell.Borders($edge)
+            if ($s.LineStyle -eq -4142) {      # xlLineStyleNone
+                $b.LineStyle = -4142
+            } else {
+                $b.LineStyle = $s.LineStyle
+                $b.Weight    = $s.Weight
+                if ($s.ColorIndex -eq -4105) { # xlColorIndexAutomatic
+                    $b.ColorIndex = -4105
+                } else {
+                    try { $b.Color = $s.Color } catch { $b.ColorIndex = -4105 }
+                }
+            }
+        } catch {}
+    }
+}
+
+# ---- Interior save/restore ----
+function Save-FaCellInteriorState {
+    param($Cell)
+    try {
+        $ci = $Cell.Interior.ColorIndex    # -4142 = xlNone
+        @{ ColorIndex = $ci
+           Color      = if ($ci -ne -4142) { try { $Cell.Interior.Color } catch { $null } } else { $null }
+           Pattern    = try { $Cell.Interior.Pattern } catch { 1 } }
+    } catch { $null }
+}
+
+function Restore-FaCellInteriorState {
+    param($Cell, $State)
+    if ($null -eq $State) { return }
+    try {
+        if ($State.ColorIndex -eq -4142) { # xlColorIndexNone — no fill
+            $Cell.Interior.ColorIndex = -4142
+        } elseif ($null -ne $State.Color) {
+            $Cell.Interior.Color = $State.Color
+        } else {
+            $Cell.Interior.ColorIndex = $State.ColorIndex
+        }
+    } catch {}
+}
+
+# ---- Clear ALL temporary Excel highlights ----
+function Clear-FaHighlights {
+    $anyBorders  = $script:FaHighlightBorderCells.Count -gt 0
+    $anyInterior = $script:FaHighlightInteriorCells.Count -gt 0
+    if (-not $anyBorders -and -not $anyInterior) { return }
+
+    # Restore borders
+    foreach ($rec in $script:FaHighlightBorderCells) {
+        try { Restore-FaCellBorderState -Cell $rec.Cell -State $rec.OrigBorders } catch {}
+        try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($rec.Cell) } catch {}
+    }
+    $script:FaHighlightBorderCells.Clear()
+
+    # Restore interiors
+    foreach ($rec in $script:FaHighlightInteriorCells) {
+        try { Restore-FaCellInteriorState -Cell $rec.Cell -State $rec.OrigInterior } catch {}
+        try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($rec.Cell) } catch {}
+    }
+    $script:FaHighlightInteriorCells.Clear()
+
+    $FaClearHighlightsBtn.IsEnabled = $false
+    Set-Status 'Formula Auditor: highlights cleared'
+}
+
+# ---- Apply a thick blue outline to one cell (stores undo) ----
+function Apply-FaBorderHighlight {
+    param($Cell)
+    $orig = Save-FaCellBorderState -Cell $Cell
+    try {
+        foreach ($edge in @(7, 8, 9, 10)) {
+            $b = $Cell.Borders($edge)
+            $b.LineStyle = 1       # xlContinuous
+            $b.Weight    = 4       # xlThick
+            $b.Color     = $script:FaBlueBorderColor
+        }
+        [void]($script:FaHighlightBorderCells.Add(@{ Cell = $Cell; OrigBorders = $orig }))
+        $FaClearHighlightsBtn.IsEnabled = $true
+    } catch {}
+}
+
+# ---- Apply a background fill to one cell (stores undo) ----
+function Apply-FaInteriorHighlight {
+    param($Cell, [long]$Color)
+    $orig = Save-FaCellInteriorState -Cell $Cell
+    try {
+        $Cell.Interior.Color = $Color
+        [void]($script:FaHighlightInteriorCells.Add(@{ Cell = $Cell; OrigInterior = $orig }))
+        $FaClearHighlightsBtn.IsEnabled = $true
+    } catch {}
+}
+
+# ---- Parse formula arguments (comma-split respecting nested parens) ----
+function Parse-FaFormulaArgs {
+    param([string]$Formula)
+    # Strip = and everything up to the first '('
+    $idx = $Formula.IndexOf('(')
+    if ($idx -lt 0) { return @() }
+    $inner = $Formula.Substring($idx + 1)
+    if ($inner.EndsWith(')')) { $inner = $inner.Substring(0, $inner.Length - 1) }
+    $result = @(); $depth = 0; $cur = ''
+    for ($i = 0; $i -lt $inner.Length; $i++) {
+        $c = $inner[$i]
+        if     ($c -eq '(') { $depth++; $cur += $c }
+        elseif ($c -eq ')') { $depth--; $cur += $c }
+        elseif ($c -eq ',' -and $depth -eq 0) { $result += $cur.Trim(); $cur = '' }
+        else   { $cur += $c }
+    }
+    if ($cur.Trim()) { $result += $cur.Trim() }
+    return $result
+}
+
+# ---- Navigate to a cell in Excel ----
+function Invoke-FaNavigateTo {
+    param([string]$Address, [switch]$PushCurrent)
+    $xl = Get-ExcelApp -Session Any
+    if (-not $xl) { return }
+    # Optionally save current cell to the back-stack
+    if ($PushCurrent) {
+        try {
+            $entry = @{
+                WbName  = [string]$xl.ActiveWorkbook.Name
+                WsName  = [string]$xl.ActiveSheet.Name
+                Address = [string]$xl.ActiveCell.Address($false, $false)
+            }
+            [void]($script:FaNavHistory.Add($entry))
+            $FaBackBtn.IsEnabled = $true
+        } catch {}
+    }
+    try {
+        if ($Address -match "^'?(.+?)'?!(.+)$") {
+            $sn = $Matches[1]; $ca = $Matches[2]
+            $ws = try { $xl.ActiveWorkbook.Worksheets.Item($sn) } catch { $null }
+            if (-not $ws) {
+                Set-Status "Cannot navigate: sheet '$sn' not found in active workbook" '#E07000'
+                return
+            }
+            $ws.Activate()
+            [void]($ws.Range($ca).Select())
+        } else {
+            [void]($xl.ActiveSheet.Range($Address).Select())
+        }
+    } catch {
+        Set-Status "Cannot navigate to '$Address': $_" '#E05050'; return
+    }
+    Invoke-FaInspect
+}
+
+# ---- Go back one step in navigation history ----
+function Invoke-FaBack {
+    if ($script:FaNavHistory.Count -eq 0) { $FaBackBtn.IsEnabled = $false; return }
+    $xl = Get-ExcelApp -Session Any
+    if (-not $xl) { return }
+    $entry = $script:FaNavHistory[$script:FaNavHistory.Count - 1]
+    $script:FaNavHistory.RemoveAt($script:FaNavHistory.Count - 1)
+    $FaBackBtn.IsEnabled = ($script:FaNavHistory.Count -gt 0)
+    try {
+        $ws = try { $xl.ActiveWorkbook.Worksheets.Item($entry.WsName) } catch { $null }
+        if ($ws) { $ws.Activate(); [void]($ws.Range($entry.Address).Select()) }
+    } catch { Set-Status "Back navigation failed: $_" '#E05050'; return }
+    Invoke-FaInspect
+}
+
+# ---- Build the precedents buttons panel ----
+function Build-FaPrecedentsPanel {
+    param($Cell, [string]$Formula)
+    $FaPrecedentsPanel.Children.Clear()
+    $refs = @()
+    if ($Formula -and $Formula.StartsWith('=')) {
+        try {
+            $prec = $Cell.Precedents
+            if ($prec) {
+                for ($ai = 1; $ai -le $prec.Areas.Count; $ai++) {
+                    $area = $prec.Areas.Item($ai)
+                    $refs += try { $area.Address($false, $false, 1, $true) } catch { $area.Address($false, $false) }
+                }
+            }
+        } catch {}
+    }
+    if ($refs.Count -gt 0) {
+        $FaNoPrecedentsTxt.Visibility = 'Collapsed'
+        foreach ($ref in $refs) {
+            $btn = New-Object System.Windows.Controls.Button
+            $btn.Content  = "$ref  →"
+            $btn.Style    = $Window.FindResource('Btn')
+            $btn.Margin   = [System.Windows.Thickness]::new(0, 2, 0, 2)
+            $btn.Padding  = [System.Windows.Thickness]::new(8, 3, 8, 3)
+            $btn.FontSize = 11
+            $btn.Tag      = $ref
+            $btn.ToolTip  = "Click to navigate to $ref"
+            $btn.Add_Click({
+                $clickedRef = [string]($args[0].Tag)
+                Invoke-FaNavigateTo -Address $clickedRef -PushCurrent
+            })
+            [void]($FaPrecedentsPanel.Children.Add($btn))
+        }
+    } else {
+        $FaNoPrecedentsTxt.Visibility = 'Visible'
+    }
+    return $refs
+}
+
+# ---- Build the precedents TreeView ----
+function Build-FaPrecedentsTree {
+    param($Cell, [string]$Formula)
+    $FaPrecedentsTree.Items.Clear()
+    if (-not ($Formula -and $Formula.StartsWith('='))) {
+        $ni = New-Object System.Windows.Controls.TreeViewItem
+        $ni.Header    = '(no formula — hardcoded or empty)'
+        $ni.Foreground = HexBrush '#6E6E6E'
+        [void]($FaPrecedentsTree.Items.Add($ni)); return
+    }
+    $areas = @()
+    try {
+        $prec = $Cell.Precedents
+        if ($prec) {
+            for ($ai = 1; $ai -le $prec.Areas.Count; $ai++) { $areas += $prec.Areas.Item($ai) }
+        }
+    } catch {}
+    if ($areas.Count -eq 0) {
+        $ni = New-Object System.Windows.Controls.TreeViewItem
+        $ni.Header    = '(no cell precedents — e.g. =TODAY(), =NOW())'
+        $ni.Foreground = HexBrush '#6E6E6E'
+        [void]($FaPrecedentsTree.Items.Add($ni)); return
+    }
+    foreach ($area in $areas) {
+        $aAddr = try { $area.Address($false, $false, 1, $true) } catch { $area.Address($false, $false) }
+        $item  = New-Object System.Windows.Controls.TreeViewItem
+        $item.Header     = $aAddr
+        $item.IsExpanded = $true
+        $item.Tag        = $aAddr
+        $item.Foreground = HexBrush '#4C9FE6'
+        $item.ToolTip    = "Click to navigate to $aAddr"
+        # Expand up to 10 child cells
+        try {
+            $cnt = $area.Cells.Count
+            $show = [Math]::Min($cnt, 10)
+            for ($ci = 1; $ci -le $show; $ci++) {
+                $cc    = $area.Cells.Item($ci)
+                $cAddr = $cc.Address($false, $false)
+                $cFml  = try { [string]$cc.Formula } catch { '' }
+                $cVal  = try { [string]$cc.Value2 } catch { '?' }
+                $label = if ($cFml -and $cFml.StartsWith('=')) { "$cAddr = $cFml" } else { "$cAddr = $cVal" }
+                $child = New-Object System.Windows.Controls.TreeViewItem
+                $child.Header    = $label
+                $child.Tag       = $cAddr
+                $child.Foreground = HexBrush '#B0B0B0'
+                $child.ToolTip   = "Click to navigate to $cAddr"
+                [void]($item.Items.Add($child))
+            }
+            if ($cnt -gt 10) {
+                $more = New-Object System.Windows.Controls.TreeViewItem
+                $more.Header    = "… $($cnt - 10) more cells"
+                $more.Foreground = HexBrush '#6E6E6E'
+                [void]($item.Items.Add($more))
+            }
+        } catch {}
+        [void]($FaPrecedentsTree.Items.Add($item))
+    }
+}
+
+# ---- Build the dependents TreeView ----
+function Build-FaDependentsTree {
+    param($Cell)
+    $FaDependentsTree.Items.Clear()
+    $areas = @()
+    try {
+        $deps = $Cell.Dependents
+        if ($deps) {
+            for ($ai = 1; $ai -le $deps.Areas.Count; $ai++) { $areas += $deps.Areas.Item($ai) }
+        }
+    } catch {}
+    if ($areas.Count -eq 0) {
+        $ni = New-Object System.Windows.Controls.TreeViewItem
+        $ni.Header    = '(nothing depends on this cell)'
+        $ni.Foreground = HexBrush '#6E6E6E'
+        [void]($FaDependentsTree.Items.Add($ni)); return
+    }
+    foreach ($area in $areas) {
+        $aAddr = try { $area.Address($false, $false, 1, $true) } catch { $area.Address($false, $false) }
+        $item  = New-Object System.Windows.Controls.TreeViewItem
+        $item.Header     = $aAddr
+        $item.IsExpanded = $false
+        $item.Tag        = $aAddr
+        $item.Foreground = HexBrush '#50A050'
+        $item.ToolTip    = "Click to navigate to $aAddr"
+        [void]($FaDependentsTree.Items.Add($item))
+    }
+}
+
+# ---- SUMIF / COUNTIF / AVERAGEIF visualizer ----
+function Invoke-FaSumifVisualize {
+    param([string]$Formula, $WorkSheet)
+    # Detect function type
+    $fn = $null
+    if    ($Formula -match '(?i)^=SUMIFS\(')     { $fn = 'SUMIFS' }
+    elseif($Formula -match '(?i)^=SUMIF\(')      { $fn = 'SUMIF' }
+    elseif($Formula -match '(?i)^=COUNTIFS\(')   { $fn = 'COUNTIFS' }
+    elseif($Formula -match '(?i)^=COUNTIF\(')    { $fn = 'COUNTIF' }
+    elseif($Formula -match '(?i)^=AVERAGEIFS\(') { $fn = 'AVERAGEIFS' }
+    elseif($Formula -match '(?i)^=AVERAGEIF\(')  { $fn = 'AVERAGEIF' }
+    if (-not $fn) {
+        $FaSumifEmptyTxt.Visibility = 'Visible'; $FaSumifGrid.Visibility = 'Collapsed'
+        $FaSumifTitleTxt.Text = 'SUMIF Visualizer — inspect a SUMIF / SUMIFS / COUNTIF / AVERAGEIF cell'
+        $FaSumifTotalTxt.Text = ''; return
+    }
+    $fargs = Parse-FaFormulaArgs -Formula $Formula
+    try {
+        $cRangeName = $null; $sRangeName = $null; $criteria = $null
+        switch ($fn) {
+            'SUMIF'      { $cRangeName = $fargs[0]; $criteria = $fargs[1]
+                           $sRangeName = if ($fargs.Count -ge 3) { $fargs[2] } else { $fargs[0] } }
+            'SUMIFS'     { $sRangeName = $fargs[0]; $cRangeName = $fargs[1]; $criteria = $fargs[2] }
+            'COUNTIF'    { $cRangeName = $fargs[0]; $criteria = $fargs[1]; $sRangeName = $null }
+            'COUNTIFS'   { $cRangeName = $fargs[0]; $criteria = $fargs[1]; $sRangeName = $null }
+            'AVERAGEIF'  { $cRangeName = $fargs[0]; $criteria = $fargs[1]
+                           $sRangeName = if ($fargs.Count -ge 3) { $fargs[2] } else { $fargs[0] } }
+            'AVERAGEIFS' { $sRangeName = $fargs[0]; $cRangeName = $fargs[1]; $criteria = $fargs[2] }
+        }
+        $cRange = $WorkSheet.Range($cRangeName)
+        $sRange = if ($sRangeName) { $WorkSheet.Range($sRangeName) } else { $null }
+        # Clean criteria
+        $crit = $criteria -replace '^"(.*)"$','$1'
+        $op = 'eq'; $compareVal = $crit
+        if ($crit -match '^(>=|<=|<>|>|<)(.+)$') { $op = $Matches[1]; $compareVal = $Matches[2] }
+        $isNum = $false; $numVal = 0.0
+        [void]([double]::TryParse($compareVal, [ref]$numVal) -and ($isNum = $true))
+        # Build rows (cap at 500 for performance)
+        $rowCount = $cRange.Rows.Count
+        $maxRows  = [Math]::Min($rowCount, 500)
+        $rows = @(); $total = 0.0; $matchCount = 0
+        for ($r = 1; $r -le $maxRows; $r++) {
+            $cCell   = $cRange.Cells.Item($r, 1)
+            $cVal    = try { $cCell.Value2 } catch { $null }
+            $cValStr = if ($null -eq $cVal) { '' } else { [string]$cVal }
+            $sVal    = $null; $sValStr = ''
+            if ($sRange) {
+                $sc = $sRange.Cells.Item($r, 1)
+                $sVal = try { $sc.Value2 } catch { $null }
+                $sValStr = if ($null -eq $sVal) { '' } else { [string]$sVal }
+            }
+            $isMatch = $false
+            switch ($op) {
+                'eq' {
+                    if ($isNum -and $null -ne $cVal) {
+                        try { $isMatch = ([double]$cVal -eq $numVal) } catch {}
+                    } elseif ($crit -match '\*|\?') {
+                        $pat = '^' + ([regex]::Escape($crit) -replace '\\\*','.*' -replace '\\\?','.') + '$'
+                        $isMatch = ($cValStr -imatch $pat)
+                    } else {
+                        $isMatch = ($cValStr -ieq $compareVal)
+                    }
+                }
+                '>=' { if ($null -ne $cVal) { try { $isMatch = ([double]$cVal -ge [double]$compareVal) } catch {} } }
+                '<=' { if ($null -ne $cVal) { try { $isMatch = ([double]$cVal -le [double]$compareVal) } catch {} } }
+                '<>' { $isMatch = ($cValStr -ine $compareVal) }
+                '>'  { if ($null -ne $cVal) { try { $isMatch = ([double]$cVal -gt [double]$compareVal) } catch {} } }
+                '<'  { if ($null -ne $cVal) { try { $isMatch = ([double]$cVal -lt [double]$compareVal) } catch {} } }
+            }
+            if ($isMatch) {
+                $matchCount++
+                if ($sRange -and $null -ne $sVal) { try { $total += [double]$sVal } catch {} }
+                # Highlight matching rows in Excel (criteria=blue, sum=green)
+                try {
+                    $cCellRef = $cRange.Cells.Item($r, 1)
+                    Apply-FaInteriorHighlight -Cell $cCellRef -Color $script:FaBlueFillColor
+                } catch {}
+                if ($sRange) {
+                    try {
+                        $sCellRef = $sRange.Cells.Item($r, 1)
+                        Apply-FaInteriorHighlight -Cell $sCellRef -Color $script:FaGreenFillColor
+                    } catch {}
+                }
+            }
+            $absRow = try { $cRange.Cells.Item($r, 1).Row } catch { $r }
+            $rows += [PSCustomObject]@{
+                RowNum      = $absRow
+                IsMatch     = $isMatch
+                MatchSymbol = if ($isMatch) { '✓' } else { '' }
+                CriteriaVal = $cValStr
+                SumVal      = if ($isMatch) { $sValStr } else { '' }
+            }
+        }
+        $suffix = if ($fn -in @('SUMIF','SUMIFS')) { "SUM = $total" }
+                  elseif ($fn -in @('COUNTIF','COUNTIFS')) { "COUNT = $matchCount" }
+                  else {
+                      $avg = if ($matchCount -gt 0) { [Math]::Round($total/$matchCount,4) } else { 0 }
+                      "AVG = $avg"
+                  }
+        $truncNote = if ($maxRows -lt $rowCount) { " (first $maxRows of $rowCount rows)" } else { " ($rowCount rows)" }
+        $FaSumifTitleTxt.Text = "$fn($cRangeName, $criteria, …)$truncNote"
+        $FaSumifTotalTxt.Text = "$suffix  •  $matchCount match(es)"
+        $FaSumifGrid.ItemsSource = $rows
+        $FaSumifEmptyTxt.Visibility = 'Collapsed'
+        $FaSumifGrid.Visibility = 'Visible'
+    } catch {
+        $FaSumifTitleTxt.Text = "$fn — parse error: $_"
+        $FaSumifTotalTxt.Text = ''
+        $FaSumifEmptyTxt.Visibility = 'Visible'
+        $FaSumifGrid.Visibility = 'Collapsed'
+    }
+}
+
+# ---- Range Audit ----
+function Invoke-FaAuditRange {
+    $xl = Get-ExcelApp -Session Any
+    if (-not $xl) { Set-Status 'Excel not connected' '#E05050'; return }
+    try {
+        $sel  = $xl.Selection
+        $ws   = $xl.ActiveSheet
+        $cnt  = $sel.Cells.Count
+        if ($cnt -gt 5000) {
+            $FaRangeDetailTxt.Text = "Selection too large ($cnt cells). Please select up to 5,000 cells."
+            $FaRangeDetailTxt.Foreground = HexBrush '#E07000'; return
+        }
+        $formulaCells  = @(); $hardcodedCells = @()
+        $crossSheetRef = @(); $externalRef    = @()
+        $sigMap = @{}
+        for ($i = 1; $i -le $cnt; $i++) {
+            $c    = $sel.Cells.Item($i)
+            $addr = $c.Address($false, $false)
+            $fml  = try { [string]$c.Formula } catch { '' }
+            $val  = try { $c.Value2 } catch { $null }
+            if ($fml -and $fml.StartsWith('=')) {
+                $formulaCells += $addr
+                $sig = $fml -replace '\$?[A-Za-z]+\$?\d+', 'REF' -replace '\d+', 'N'
+                $sigMap[$sig] = ($sigMap[$sig] -as [int]) + 1
+                if ($fml -match "(?i)[A-Za-z0-9_' ]+!") { $crossSheetRef += $addr }
+                if ($fml -match '\[.+\]')                { $externalRef   += $addr }
+                # Temporarily highlight formula cells with thick blue outline
+                $cellRef = $sel.Cells.Item($i)
+                Apply-FaBorderHighlight -Cell $cellRef
+            } elseif ($null -ne $val -and [string]$val -ne '') {
+                $hardcodedCells += $addr
+            }
+        }
+        $total = $formulaCells.Count + $hardcodedCells.Count
+        $fPct  = if ($total -gt 0) { "$($formulaCells.Count) ($([Math]::Round($formulaCells.Count*100/$total,0))%)" } else { '0' }
+        $hPct  = if ($total -gt 0) { "$($hardcodedCells.Count) ($([Math]::Round($hardcodedCells.Count*100/$total,0))%)" } else { '0' }
+        $FaRangeAddrTxt.Text      = $sel.Address($false, $false)
+        $FaRangeFormulaTxt.Text   = $fPct
+        $FaRangeHardcodedTxt.Text = $hPct
+        $FaRangeExternalTxt.Text  = if ($externalRef.Count -gt 0) { "⚠ $($externalRef.Count) external ref(s)" } else { '' }
+        $details = @()
+        if ($crossSheetRef.Count -gt 0) { $details += "Cross-sheet refs: $($crossSheetRef -join ', ')" }
+        if ($externalRef.Count   -gt 0) { $details += "External workbook refs: $($externalRef -join ', ')" }
+        if ($sigMap.Count -gt 1) {
+            $sorted = $sigMap.GetEnumerator() | Sort-Object Value -Descending
+            $majority = ($sorted | Select-Object -First 1).Key
+            foreach ($m in ($sorted | Select-Object -Skip 1)) {
+                $details += "Inconsistent formula ($($m.Value) cell(s) differ): $($m.Key)"
+            }
+        }
+        if ($details.Count -eq 0) {
+            $details += "No issues detected.  $($formulaCells.Count) formula cell(s), $($hardcodedCells.Count) hardcoded, $($cnt - $formulaCells.Count - $hardcodedCells.Count) empty."
+        }
+        $FaRangeDetailTxt.Text       = ($details -join "`n")
+        $FaRangeDetailTxt.Foreground = HexBrush '#B0B0B0'
+        Set-Status "Range audit complete: $($sel.Address($false,$false))  ($cnt cells, $($formulaCells.Count) formulas highlighted in blue)"
+    } catch {
+        $FaRangeDetailTxt.Text       = "Range audit error: $_"
+        $FaRangeDetailTxt.Foreground = HexBrush '#E05050'
+        Set-Status "Range audit error: $_" '#E05050'
+    }
+}
+
+# ---- Main inspect function ----
+function Invoke-FaInspect {
+    $xl = Get-ExcelApp -Session Any
+    if (-not $xl) {
+        $FaActiveCellTxt.Text = '(Excel not connected)'
+        $FaFormulaTxt.Text    = '—'
+        return
+    }
+    $cell = $null; $ws = $null; $wb = $null
+    try { $wb = $xl.ActiveWorkbook; $ws = $xl.ActiveSheet; $cell = $xl.ActiveCell } catch { return }
+    if (-not $cell) { return }
+    $addr   = try { [string]$cell.Address($false, $false) } catch { '?' }
+    $wsName = try { [string]$ws.Name } catch { '?' }
+    $wbName = try { [string]$wb.Name } catch { '?' }
+    # Top bar
+    $FaActiveCellTxt.Text = "$wsName!$addr"
+    $formula = try { [string]$cell.Formula } catch { '' }
+    $value   = try { $cell.Value2 } catch { $null }
+    $FaFormulaTxt.Text = if ($formula -and $formula.StartsWith('=')) { $formula }
+                         elseif ($null -eq $value -or [string]$value -eq '') { '(empty)' }
+                         else { [string]$value }
+    # Inspector card
+    $cellType = if ($formula -and $formula.StartsWith('=')) { 'Formula' }
+                elseif ($null -eq $value -or [string]$value -eq '') { 'Empty' }
+                else { 'Hardcoded' }
+    $FaCellTypeTxt.Text  = $cellType
+    $FaCellValueTxt.Text = if ($null -eq $value) { '(null)' } else { [string]$value }
+    $FaCellSheetTxt.Text = $wsName
+    # Precedents panel + tree
+    Build-FaPrecedentsPanel -Cell $cell -Formula $formula
+    Build-FaPrecedentsTree  -Cell $cell -Formula $formula
+    # Dependents
+    $depCount = 0
+    try { $deps = $cell.Dependents; if ($deps) { $depCount = $deps.Cells.Count } } catch {}
+    $FaDependentCountTxt.Text = if ($depCount -gt 0) { "$depCount cell(s)" } else { 'none' }
+    Build-FaDependentsTree -Cell $cell
+    # SUMIF visualizer
+    if ($formula -match '(?i)^=(SUM|COUNT|AVERAGE)IFS?\(') {
+        Invoke-FaSumifVisualize -Formula $formula -WorkSheet $ws
+    } else {
+        $FaSumifEmptyTxt.Visibility = 'Visible'; $FaSumifGrid.Visibility = 'Collapsed'
+        $FaSumifTitleTxt.Text = 'SUMIF Visualizer — inspect a SUMIF / SUMIFS / COUNTIF / AVERAGEIF cell'
+        $FaSumifTotalTxt.Text = ''
+    }
+}
+
+# ================================================================
+#  FORMULA AUDITOR — 500 ms polling timer
+# ================================================================
+$script:FaTimer          = New-Object System.Windows.Threading.DispatcherTimer
+$script:FaTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$script:FaTimer.Add_Tick({
+    if ($MainTabs.SelectedIndex -ne 8) { return }
+    if (-not $FaAutoBox.IsChecked)     { return }
+    $xl = Get-ExcelApp -Session Any
+    if (-not $xl) { $FaActiveCellTxt.Text = '(Excel not connected)'; return }
+    try {
+        $cell = $xl.ActiveCell
+        if (-not $cell) { return }
+        $sig = "$([string]$xl.ActiveWorkbook.Name)!$([string]$xl.ActiveSheet.Name)!$([string]$cell.Address($false,$false))"
+        if ($sig -eq $script:FaLastCellSig) { return }
+        $script:FaLastCellSig = $sig
+        Invoke-FaInspect
+    } catch {}
+})
+$script:FaTimer.Start()
+
+# ================================================================
+#  FORMULA AUDITOR — event handlers
+# ================================================================
+$FaInspectBtn.Add_Click({ Invoke-FaInspect })
+$FaBackBtn.Add_Click({ Invoke-FaBack })
+$FaAuditRangeBtn.Add_Click({ Invoke-FaAuditRange })
+$FaClearHighlightsBtn.Add_Click({ Clear-FaHighlights })
+
+# Tree node click — navigate to selected cell
+$FaPrecedentsTree.Add_SelectedItemChanged({
+    $node = $FaPrecedentsTree.SelectedItem
+    if ($node -and $node.Tag) { Invoke-FaNavigateTo -Address ([string]$node.Tag) -PushCurrent }
+})
+$FaDependentsTree.Add_SelectedItemChanged({
+    $node = $FaDependentsTree.SelectedItem
+    if ($node -and $node.Tag) { Invoke-FaNavigateTo -Address ([string]$node.Tag) -PushCurrent }
+})
+
+# Clear highlights automatically when leaving the Formula Auditor tab
+$MainTabs.Add_SelectionChanged({
+    if ($MainTabs.SelectedIndex -ne 8) { Clear-FaHighlights }
+})
+
+# Mark Tab 0 (Clipboard) + Tab 1 (Macros) + Tab 4 (Templates) + Tab 8 (Formula Auditor — timer-driven) as already loaded
 $script:TabsLoaded[0] = $true
 $script:TabsLoaded[1] = $true
 $script:TabsLoaded[4] = $true
 $script:TabsLoaded[5]  = $true
+$script:TabsLoaded[8] = $true
 
-Set-Status 'MacroHub v3.2 ready — Ctrl+PgUp/PgDn tabs  |  Ctrl+0–9 jump  |  Ctrl+F search'
+Set-Status 'MacroHub v3.2 ready — Alt+1–9 tabs  |  Ctrl+Tab cycle  |  Ctrl+F search'
 
 # Check for missed scheduled tasks AFTER window is visible
 $Window.Add_ContentRendered({
@@ -6470,9 +7764,16 @@ $Window.Add_ContentRendered({
 # -- Dismiss keytips when window loses focus --
 $Window.Add_Deactivated({ if ($script:KeyTipsActive) { Hide-KeyTips } })
 
+# -- Formula Auditor: stop timer and clear Excel highlights when window closes --
+$Window.Add_Closing({
+    if ($script:FaTimer) { $script:FaTimer.Stop() }
+    try { Clear-FaHighlights } catch {}
+})
+
 # ================================================================
 #  SHOW WINDOW
 # ================================================================
+# ShowDialog() is a blocking call: the script waits here until the window closes.
 $Window.ShowDialog()
 
 }  # END Start-MacroHub
@@ -6480,5 +7781,6 @@ $Window.ShowDialog()
 # ================================================================
 #  LAUNCH
 # ================================================================
+# Script entry point: simply calls Start-MacroHub which builds the UI and blocks.
 Start-MacroHub
 
